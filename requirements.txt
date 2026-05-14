@@ -1,0 +1,11 @@
+google-genai>=1.0.0
+scikit-learn>=1.3.0
+medmnist>=2.2.3
+arxiv>=2.1.0
+requests>=2.31.0
+pdfplumber>=0.11.0
+rich>=13.7.0
+tenacity>=8.2.0
+python-dotenv>=1.0.0
+datasets>=2.0.0
+Pillow>=9.0.0

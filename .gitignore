@@ -1,0 +1,7 @@
+.env
+memory/papers/
+memory/hypotheses.json
+memory/last_analysis.txt
+__pycache__/
+*.pyc
+results
