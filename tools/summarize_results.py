@@ -26,44 +26,50 @@ def main():
 
         summary = _read_json(summary_path)
         best_metric = summary.get("best_metric")
-        best_ckpt = summary.get("best_ckpt")
 
         last_epoch = None
-        last_chex = None
-        last_nih = None
-        last_dl = None
+        probes: dict[str, dict] = {}
         if metrics_path.exists():
             try:
                 metrics = _read_json(metrics_path)
                 if isinstance(metrics, list) and metrics:
                     m = metrics[-1]
                     last_epoch = m.get("epoch")
-                    cp = m.get("chexpert_probe") or None
-                    np = m.get("nih14_probe") or None
-                    dp = m.get("deeplesion_probe") or None
-                    last_chex = cp.get("macro_auroc") if isinstance(cp, dict) else None
-                    last_nih = np.get("macro_auroc") if isinstance(np, dict) else None
-                    last_dl = dp.get("macro_auroc") if isinstance(dp, dict) else None
+                    for key in ("chexpert_probe", "nih14_probe", "deeplesion_probe", "chestmnist_probe"):
+                        p = m.get(key)
+                        probes[key] = p if isinstance(p, dict) else {}
             except Exception:
                 pass
 
-        rows.append(
-            {
-                "run": run_dir.name,
-                "best_metric": best_metric,
-                "best_ckpt": best_ckpt,
-                "last_epoch": last_epoch,
-                "last_chexpert_macro_auroc": last_chex,
-                "last_nih14_macro_auroc": last_nih,
-                "last_deeplesion_macro_auroc": last_dl,
-            }
-        )
+        def get(key: str, field: str):
+            return (probes.get(key) or {}).get(field)
+
+        rows.append({
+            "run":             run_dir.name,
+            "best_metric":     best_metric,
+            "last_epoch":      last_epoch,
+            # CheXpert
+            "chex_auroc":      get("chexpert_probe",  "macro_auroc"),
+            "chex_f1":         get("chexpert_probe",  "macro_f1"),
+            "chex_recall":     get("chexpert_probe",  "macro_recall"),
+            # NIH14
+            "nih_auroc":       get("nih14_probe",      "macro_auroc"),
+            "nih_f1":          get("nih14_probe",      "macro_f1"),
+            "nih_recall":      get("nih14_probe",      "macro_recall"),
+            # DeepLesion
+            "dl_auroc":        get("deeplesion_probe", "macro_auroc"),
+            "dl_f1":           get("deeplesion_probe", "macro_f1"),
+            "dl_recall":       get("deeplesion_probe", "macro_recall"),
+            # ChestMNIST
+            "cm_auroc":        get("chestmnist_probe", "macro_auroc"),
+            "cm_f1":           get("chestmnist_probe", "macro_f1"),
+            "cm_recall":       get("chestmnist_probe", "macro_recall"),
+        })
 
     if not rows:
         print("No runs found under results/ (expected summary.json).")
         return
 
-    # Print a compact table (no extra deps).
     def fmt(x):
         if x is None:
             return "-"
@@ -72,12 +78,13 @@ def main():
         return str(x)
 
     cols = [
-        ("run", 36),
-        ("best_metric", 10),
-        ("last_chexpert_macro_auroc", 10),
-        ("last_nih14_macro_auroc", 10),
-        ("last_deeplesion_macro_auroc", 12),
-        ("last_epoch", 9),
+        ("run",        34),
+        ("best_metric", 6),
+        ("chex_auroc",  6), ("chex_f1",  6), ("chex_recall",  6),
+        ("nih_auroc",   6), ("nih_f1",   6), ("nih_recall",   6),
+        ("dl_auroc",    6), ("dl_f1",    6), ("dl_recall",    6),
+        ("cm_auroc",    6), ("cm_f1",    6), ("cm_recall",    6),
+        ("last_epoch",  5),
     ]
     header = " ".join([c[0].ljust(c[1]) for c in cols])
     print(header)
@@ -89,4 +96,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import faulthandler
+faulthandler.enable()
+
 import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("ATEN_CPU_CAPABILITY", "avx2")
 
 import argparse
+import functools
 import importlib
 import json
 import math
@@ -27,11 +34,12 @@ from experiments.data_loaders import (
     PMCOADataset, PMCQAChoicesDataset,
     collate_oa, collate_qa, collate_combined,
     HomogeneousBatchSampler,
-    run_linear_probe,
 )
 from experiments.models import FrozenTeacher
 from config.experiment_cfg import EXPERIMENTS, add_shared_args
+from config.baseline_cfg import TEACHERS
 from tools.reporting import write_results_md, print_table_header, print_run_row, COL_W
+from tools.utils import run_linear_probe
 
 
 def find_best_gpu() -> str:
@@ -66,7 +74,7 @@ def eval_pmcqa_mc_accuracy(
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=0,
         pin_memory=False, drop_last=False,
-        collate_fn=lambda ex: collate_qa(ex, teacher.preprocess),
+        collate_fn=lambda ex: collate_qa(ex, teacher.preprocess)
     )
     total, correct = 0, 0
     for batch in loader:
@@ -130,24 +138,38 @@ def run_eval_probes(
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+    def _log_probe(name: str, probe: dict) -> None:
+        prefix = f"eval/{name}"
+        writer.add_scalar(f"{prefix}_macro_auroc", float(probe["macro_auroc"]), epoch)
+        writer.add_scalar(f"{prefix}_macro_f1",    float(probe["macro_f1"]),    epoch)
+        writer.add_scalar(f"{prefix}_macro_recall", float(probe["macro_recall"]), epoch)
+        print(
+            f"  [epoch {epoch}] {name:12s}  AUROC={probe['macro_auroc']:.2f}"
+            f"  F1={probe['macro_f1']:.2f}  Recall={probe['macro_recall']:.2f}",
+            flush=True,
+        )
+
     nih14_probe = None
     if args.run_nih14_probe:
         print(f"\n  [epoch {epoch}] running NIH14 linear probe ...", flush=True)
         nih14_probe = run_linear_probe(
-                model=student,
-                dataset_name="nih14_auroc",
-                image_size=224,
-                device=device,
-                batch_size=128,
-                nih_data_dir=args.nih14_dir,
-                nih_csv_path=args.nih14_csv,
-                nih_images_dir=args.nih14_images_dir,
-                image_transform=teacher.preprocess,
-                max_samples=args.probe_max_samples,
-                seed=args.seed,
-            )
-        print(f"  [epoch {epoch}] NIH14 macro AUROC: {nih14_probe['macro_auroc']:.2f}", flush=True)
-        writer.add_scalar("eval/nih14_macro_auroc", float(nih14_probe["macro_auroc"]), epoch)
+            model=student,
+            dataset_name="nih14_auroc",
+            image_size=224,
+            device=device,
+            batch_size=128,
+            nih_data_dir=args.nih14_dir,
+            nih_csv_path=args.nih14_csv,
+            nih_images_dir=args.nih14_images_dir,
+            image_transform=teacher.preprocess,
+            max_samples=args.probe_max_samples,
+            seed=args.seed,
+            writer=writer,
+            attn_encoder_specs=TEACHERS,
+            attn_tag="attention/nih14",
+            attn_step=epoch,
+        )
+        _log_probe("nih14", nih14_probe)
 
     chexpert_probe = None
     if (
@@ -158,20 +180,23 @@ def run_eval_probes(
     ):
         print(f"  [epoch {epoch}] running CheXpert linear probe ...", flush=True)
         chexpert_probe = run_linear_probe(
-                model=student,
-                dataset_name="chexpert_auroc",
-                image_size=224,
-                device=device,
-                batch_size=128,
-                chexpert_images_dir=args.chexpert_images_dir,
-                chexpert_csv_path=args.chexpert_csv,
-                chexpert_uncertain_policy=args.chexpert_uncertain_policy,
-                image_transform=teacher.preprocess,
-                max_samples=args.probe_max_samples,
-                seed=args.seed,
-            )
-        print(f"  [epoch {epoch}] CheXpert macro AUROC: {chexpert_probe['macro_auroc']:.2f}", flush=True)
-        writer.add_scalar("eval/chexpert_macro_auroc", float(chexpert_probe["macro_auroc"]), epoch)
+            model=student,
+            dataset_name="chexpert_auroc",
+            image_size=224,
+            device=device,
+            batch_size=128,
+            chexpert_images_dir=args.chexpert_images_dir,
+            chexpert_csv_path=args.chexpert_csv,
+            chexpert_uncertain_policy=args.chexpert_uncertain_policy,
+            image_transform=teacher.preprocess,
+            max_samples=args.probe_max_samples,
+            seed=args.seed,
+            writer=writer,
+            attn_encoder_specs=TEACHERS,
+            attn_tag="attention/chexpert",
+            attn_step=epoch,
+        )
+        _log_probe("chexpert", chexpert_probe)
 
     deeplesion_probe = None
     if (
@@ -181,20 +206,46 @@ def run_eval_probes(
     ):
         print(f"  [epoch {epoch}] running DeepLesion linear probe ...", flush=True)
         deeplesion_probe = run_linear_probe(
-                model=student,
-                dataset_name="deeplesion_auroc",
-                image_size=224,
-                device=device,
-                batch_size=128,
-                deeplesion_data_dir=args.deeplesion_dir,
-                image_transform=teacher.preprocess,
-                max_samples=args.probe_max_samples,
-                seed=args.seed,
-            )
-        print(f"  [epoch {epoch}] DeepLesion macro AUROC: {deeplesion_probe['macro_auroc']:.2f}", flush=True)
-        writer.add_scalar("eval/deeplesion_macro_auroc", float(deeplesion_probe["macro_auroc"]), epoch)
+            model=student,
+            dataset_name="deeplesion_auroc",
+            image_size=224,
+            device=device,
+            batch_size=128,
+            deeplesion_data_dir=args.deeplesion_dir,
+            image_transform=teacher.preprocess,
+            max_samples=args.probe_max_samples,
+            seed=args.seed,
+            writer=writer,
+            attn_encoder_specs=TEACHERS,
+            attn_tag="attention/deeplesion",
+            attn_step=epoch,
+        )
+        _log_probe("deeplesion", deeplesion_probe)
 
-    return {"nih14_probe": nih14_probe, "chexpert_probe": chexpert_probe, "deeplesion_probe": deeplesion_probe}
+    chestmnist_probe = None
+    if args.run_chestmnist_probe:
+        print(f"  [epoch {epoch}] running ChestMNIST linear probe ...", flush=True)
+        chestmnist_probe = run_linear_probe(
+            model=student,
+            dataset_name="chestmnist",
+            image_size=224,
+            device=device,
+            batch_size=128,
+            seed=args.seed,
+            writer=writer,
+            attn_encoder_specs=TEACHERS,
+            attn_tag="attention/chestmnist",
+            attn_step=epoch,
+        )
+        _log_probe("chestmnist", chestmnist_probe)
+
+    return {
+        "nih14_probe": nih14_probe,
+        "chexpert_probe": chexpert_probe,
+        "deeplesion_probe": deeplesion_probe,
+        "chestmnist_probe": chestmnist_probe,
+    }
+
 
 
 # ── training ───────────────────────────────────────────────────────────────────
@@ -211,12 +262,14 @@ def build_loader(args: argparse.Namespace, teacher: FrozenTeacher) -> DataLoader
     oa_ds = PMCOADataset(image_dir=args.pmc_oa_image_dir, jsonl_path=args.pmc_oa_jsonl, seed=args.seed)
     qa_ds = PMCQAChoicesDataset(image_dir=args.pmc_qa_image_dir, csv_path=args.pmc_qa_train_csv, seed=args.seed)
     sampler = HomogeneousBatchSampler(len(oa_ds), len(qa_ds), args.batch_size, seed=args.seed)
+    preprocess = teacher.preprocess
     return DataLoader(
         ConcatDataset([oa_ds, qa_ds]),
         batch_sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=lambda ex: collate_combined(ex, teacher.preprocess),
+        pin_memory=False,
+        collate_fn=functools.partial(collate_combined, preprocess=preprocess),
+        persistent_workers=False,
     )
 
 
@@ -320,6 +373,7 @@ def train_loop(
                 {
                     "student_state_dict": student.state_dict(),
                     "args": vars(args),
+                    "exp_args": vars(exp_args),
                     "epoch": epoch,
                     "global_step": global_step,
                     "best_metric": best_metric,
@@ -328,7 +382,7 @@ def train_loop(
             )
 
         torch.save(
-            {"student_state_dict": student.state_dict(), "args": vars(args), "epoch": epoch, "global_step": global_step},
+            {"student_state_dict": student.state_dict(), "args": vars(args), "exp_args": vars(exp_args), "epoch": epoch, "global_step": global_step},
             last_ckpt,
         )
 
@@ -370,6 +424,9 @@ def _run_one(name: str, config: dict, shared_args: argparse.Namespace, remaining
     optimizer = torch.optim.AdamW(student.parameters(), lr=shared_args.lr, weight_decay=shared_args.weight_decay)
     scaler = GradScaler(device.split(":")[0], enabled=device.startswith("cuda"))
     run_dir = make_run_dir(shared_args.log_dir, name)
+    (run_dir / "config.json").write_text(
+        json.dumps({"experiment": name, **vars(shared_args), "exp_args": vars(exp_args)}, indent=2)
+    )
     writer = SummaryWriter(str(run_dir / "tb"))
     try:
         summary, last_probe = train_loop(
@@ -380,15 +437,10 @@ def _run_one(name: str, config: dict, shared_args: argparse.Namespace, remaining
         print_run_row(run_dir.name, last_probe)
         write_results_md(shared_args.log_dir, shared_args.results_md)
         print(json.dumps(summary, indent=2))
-        
-        del loader, optimizer, scaler, student, teacher, probe_model
-        if device.startswith("cuda"):
-            torch.cuda.empty_cache()
     except Exception as e:
         print(f"  {'FAILED ' + name:<{COL_W - 2}} {'ERROR':>14} {str(e)[:40]}")
-
     finally:
-        del loader, optimizer, scaler, student, teacher, probe_model
+        loader = optimizer = scaler = student = teacher = probe_model = None
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
 
@@ -415,4 +467,6 @@ def main():
 
 
 if __name__ == "__main__":
+
+
     main()

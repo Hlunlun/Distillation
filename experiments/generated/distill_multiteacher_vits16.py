@@ -5,34 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from experiments.data_loaders import BatchOA
-from experiments.models import FrozenTeacher, kl_logits, require_timm
-
-
-class StudentDualHead(nn.Module):
-    def __init__(self, timm_name: str, out_dim_primary: int, out_dim_secondary: int):
-        super().__init__()
-        timm = require_timm()
-        self.backbone = timm.create_model(timm_name, pretrained=True, num_classes=0)
-        in_dim = getattr(self.backbone, "num_features", None)
-        if in_dim is None:
-            raise RuntimeError(f"Unsupported timm model (missing num_features): {timm_name}")
-        self.proj_primary = nn.Linear(int(in_dim), int(out_dim_primary), bias=False)
-        self.proj_secondary = nn.Linear(int(in_dim), int(out_dim_secondary), bias=False)
-
-    def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        feats = self.backbone(images)
-        return (
-            F.normalize(self.proj_primary(feats), dim=-1),
-            F.normalize(self.proj_secondary(feats), dim=-1),
-        )
-
-    def encode_primary(self, images: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.proj_primary(self.backbone(images)), dim=-1)
+from experiments.models import FrozenTeacher, StudentDualHead, kl_logits
 
 
 class PrimaryWrapper(nn.Module):
-    """Wraps StudentDualHead to expose only the primary head for eval/probe."""
-
     def __init__(self, student: StudentDualHead):
         super().__init__()
         self._student = student

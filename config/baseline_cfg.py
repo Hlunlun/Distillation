@@ -13,6 +13,12 @@ TEACHERS: list[dict] = [
         "model_id": "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
     },
     {
+        "name": "PubMedCLIP ViT-B/32",
+        "type": "teacher",
+        "loader": "hf_clip",
+        "model_id": "flaviagiammarino/pubmed-clip-vit-base-patch32",
+    },
+    {
         "name": "RadCLIP",
         "type": "teacher",
         "loader": "pth_hf_clip",
@@ -51,6 +57,7 @@ def add_baseline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--deeplesion_dir", default=PATHS.deeplesion_dir)
     p.add_argument("--deeplesion_csv", default=None)
     p.add_argument("--run_deeplesion_probe", default=True, action=argparse.BooleanOptionalAction)
+    p.add_argument("--run_chestmnist_probe", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--nih14_dir", default=None)
     p.add_argument("--nih14_images_dir", default=PATHS.nih14_images_dir)
     p.add_argument("--nih14_csv", default=PATHS.nih14_csv)
@@ -59,3 +66,5 @@ def add_baseline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--log_dir", default="results")
     p.add_argument("--only", default="", help="Comma-separated model names to run (substring match).")
+    p.add_argument("--tb_dir", default=None, help="TensorBoard log dir (default: <log_dir>/baseline_<ts>/tb)")
+    p.add_argument("--attn_samples", type=int, default=4, help="Number of sample images for attention grid")

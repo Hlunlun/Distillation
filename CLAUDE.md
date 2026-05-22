@@ -7,6 +7,8 @@ No Gemini dependency — all steps performed directly by Claude Code via WebSear
 ## Skills
 - karpathy-guidelines
 - 不要我問個問題就直接改code，先跟我講完我確認再改
+- 講中文 Speak Chinese!
+
 
 ## Project Structure
 

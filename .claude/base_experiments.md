@@ -46,3 +46,27 @@ Run dir: `baseline_20260511_224812`
 | RadCLIP | teacher | 75.94 | 74.18 | 93.98 |
 | PLIP | teacher | 68.21 | 67.63 | 91.77 |
 | QuiltNet-B-32 | teacher | 66.89 | 65.67 | 90.75 |
+
+### Baseline Run — 2026-05-19 15:16
+Run dir: `baseline_20260519_130708`
+
+| Model | Type | Chex AUROC | Chex F1 | Chex Recall | NIH14 AUROC | NIH F1 | NIH Recall | DL AUROC | DL F1 | DL Recall | CM AUROC | CM F1 | CM Recall |
+|-------|------|------------|---------|-------------|-------------|--------|------------|----------|-------|-----------|----------|-------|-----------|
+| ViT-S/16 (ImageNet, no distill) | student | 65.88 | 11.76 | 10.96 | 66.66 | 0.00 | 0.00 | 91.95 | 33.94 | 28.68 | 66.41 | 0.00 | 0.00 |
+| BiomedCLIP ViT-B/16 | teacher | - | - | - | - | - | - | - | - | - | - | - | - |
+| PubMedCLIP ViT-B/32 | teacher | 65.77 | 10.25 | 9.01 | 66.38 | 0.00 | 0.00 | 92.45 | 40.80 | 38.12 | 66.11 | 0.00 | 0.00 |
+| RadCLIP | teacher | 73.99 | 19.79 | 18.92 | 68.74 | 0.45 | 0.24 | 92.50 | 46.23 | 41.54 | 66.84 | 0.15 | 0.07 |
+| PLIP | teacher | - | - | - | - | - | - | - | - | - | - | - | - |
+| QuiltNet-B-32 | teacher | 63.81 | 6.02 | 5.80 | 64.28 | 0.00 | 0.00 | 88.70 | 11.60 | 10.37 | 64.05 | 0.00 | 0.00 |
+
+### Baseline Run — 2026-05-22 18:06
+Run dir: `baseline_20260522_180629`
+
+| Model | Type | Chex AUROC | Chex F1 | Chex Recall | NIH14 AUROC | NIH F1 | NIH Recall | DL AUROC | DL F1 | DL Recall | CM AUROC | CM F1 | CM Recall |
+|-------|------|------------|---------|-------------|-------------|--------|------------|----------|-------|-----------|----------|-------|-----------|
+| ViT-S/16 (ImageNet, no distill) | student | - | - | - | - | - | - | - | - | - | - | - | - |
+| BiomedCLIP ViT-B/16 | teacher | - | - | - | - | - | - | - | - | - | - | - | - |
+| PubMedCLIP ViT-B/32 | teacher | - | - | - | - | - | - | - | - | - | - | - | - |
+| RadCLIP | teacher | - | - | - | - | - | - | - | - | - | - | - | - |
+| PLIP | teacher | - | - | - | - | - | - | - | - | - | - | - | - |
+| QuiltNet-B-32 | teacher | - | - | - | - | - | - | - | - | - | - | - | - |

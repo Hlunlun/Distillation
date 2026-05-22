@@ -26,6 +26,39 @@ EXPERIMENTS: dict[str, dict] = {
             {"name": "queue_size", "type": int, "default": 4096},
         ],
     },
+    "barlow_patch": {
+        "module": "experiments.generated.distill_barlow_patch_vits16",
+        "args": [
+            {"name": "w_barlow",   "type": float, "default": 1.0},
+            {"name": "lam_barlow", "type": float, "default": 5e-3},
+            {"name": "w_patch",    "type": float, "default": 1.0},
+        ],
+    },
+    "cosmos": {
+        "module": "experiments.generated.distill_cosmos_vits16",
+        "args": [
+            {"name": "tgac_k",        "type": int,   "default": 4},
+            {"name": "num_crops",     "type": int,   "default": 2},
+            {"name": "ema_momentum",  "type": float, "default": 0.999},
+            {"name": "w_lg",          "type": float, "default": 1.0},
+            {"name": "w_crop",        "type": float, "default": 0.5},
+            {"name": "timm_student",  "type": str,   "default": "vit_small_patch16_224"},
+        ],
+    },
+    "alignkd_cosmos": {
+        "module": "experiments.generated.distill_alignkd_cosmos_vits16",
+        "args": [
+            {"name": "tgac_k",            "type": int,   "default": 4},
+            {"name": "num_crops",         "type": int,   "default": 2},
+            {"name": "ema_momentum",      "type": float, "default": 0.999},
+            {"name": "w_lg",              "type": float, "default": 1.0},
+            {"name": "w_crop",            "type": float, "default": 0.5},
+            {"name": "w_layer",           "type": float, "default": 1.0},
+            {"name": "top_k_layers",      "type": int,   "default": 2},
+            {"name": "analysis_n_images", "type": int,   "default": 128},
+            {"name": "w_tqva",            "type": float, "default": 1.0},
+        ],
+    },
     "multiteacher": {
         "module": "experiments.generated.distill_multiteacher_vits16",
         "args": [
@@ -35,6 +68,31 @@ EXPERIMENTS: dict[str, dict] = {
             {"name": "teacher_secondary_pretrained", "type": str,   "default": None},
             {"name": "w_img_primary",                "type": float, "default": 1.0},
             {"name": "w_img_secondary",              "type": float, "default": 0.5},
+        ],
+    },
+    # ── thesis contribution experiments ──────────────────────────────────────
+    "slot": {
+        "module": "experiments.generated.distill_slot_vits16",
+        "args": [
+            {"name": "num_slots",    "type": int,   "default": 8},
+            {"name": "num_heads",    "type": int,   "default": 4},
+            {"name": "w_slot_div",   "type": float, "default": 0.1},
+            {"name": "timm_student", "type": str,   "default": "vit_small_patch16_224"},
+        ],
+    },
+    "hier": {
+        "module": "experiments.generated.distill_hier_vits16",
+        "args": [
+            {"name": "w_scale",      "type": float, "default": 1.0},
+            {"name": "timm_student", "type": str,   "default": "vit_small_patch16_224"},
+        ],
+    },
+    "tgba": {
+        "module": "experiments.generated.distill_tgba_vits16",
+        "args": [
+            {"name": "bottleneck_dim", "type": int,   "default": 256},
+            {"name": "w_sparsity",     "type": float, "default": 0.01},
+            {"name": "timm_student",   "type": str,   "default": "vit_small_patch16_224"},
         ],
     },
 }
@@ -48,6 +106,7 @@ def add_shared_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--pmc_qa_test_csv", default=PATHS.pmc_qa_test_csv)
     p.add_argument("--run_nih14_probe", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--run_deeplesion_probe", default=True, action=argparse.BooleanOptionalAction)
+    p.add_argument("--run_chestmnist_probe", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--deeplesion_dir", default=PATHS.deeplesion_dir)
     p.add_argument("--nih14_dir", default=None)
     p.add_argument("--nih14_images_dir", default=PATHS.nih14_images_dir)
@@ -56,12 +115,18 @@ def add_shared_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--chexpert_csv", default=PATHS.chexpert_csv)
     p.add_argument("--chexpert_uncertain_policy", default="zeros")
     p.add_argument("--probe_max_samples", type=int, default=50000)
-    p.add_argument("--timm_student", default="vit_small_patch16_224")
-    p.add_argument("--teacher_model", default="hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224")
+    p.add_argument("--timm_student", default="vit_small_patch16_224", choices=["vit_tiny_patch16_224", "vit_small_patch16_224", "vit_base_patch16_224", "resnet50"])
+    p.add_argument("--teacher_model", default="hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
+        choices=[
+            "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
+            "hf-hub:wisdomik/QuiltNet-B-32",
+            "hf-hub:MahmoodLab/conch",       # license-gated: hf.co/MahmoodLab/conch
+            "hf-pth-clip:zluvolyote/RadCLIP", # image-only, no OA loss
+        ])
     p.add_argument("--teacher_pretrained", default=None)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--num_workers", type=int, default=6)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_ratio", type=float, default=0.15)
