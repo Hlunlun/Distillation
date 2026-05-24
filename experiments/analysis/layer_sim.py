@@ -15,6 +15,7 @@ Importable:
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -241,7 +242,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--pmc_oa_image_dir", default=paths_cfg.pmc_oa_image_dir)
     p.add_argument("--pmc_oa_jsonl", default=paths_cfg.pmc_oa_jsonl)
-    p.add_argument("--log_dir", default="results/analysis")
+    p.add_argument("--log_dir", default=f"results/analysis/layer_sim_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     p.add_argument("--top_k", type=int, default=2)
     p.add_argument("--n_images", type=int, default=128)
     p.add_argument("--teacher_model",

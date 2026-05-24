@@ -250,6 +250,7 @@ class NIHChestXray14Dataset(Dataset):
         csv_path: Optional[str] = None,
         images_dir: Optional[str] = None,
         transform=None,
+        split_list: Optional[list] = None,
     ):
         if data_dir is None and (csv_path is None or images_dir is None):
             raise ValueError("Provide either data_dir, or both csv_path and images_dir for NIH14.")
@@ -274,11 +275,14 @@ class NIHChestXray14Dataset(Dataset):
             raise FileNotFoundError(f"Missing NIH14 labels CSV: {labels_file}")
         if img_dir is None or not img_dir.exists():
             raise FileNotFoundError(f"Missing NIH14 images dir: {img_dir}")
+        split_set: Optional[set] = set(split_list) if split_list is not None else None
         label_to_idx = {l: i for i, l in enumerate(self.LABELS_14)}
         samples: list[tuple[Path, np.ndarray]] = []
         with labels_file.open("r", newline="") as f:
             reader = csv.DictReader(f)
             rows = list(reader)
+        if split_set is not None:
+            rows = [r for r in rows if (r.get("Image Index") or "").strip() in split_set]
         if max_samples is not None and max_samples < len(rows):
             rng = random.Random(seed)
             rows = rng.sample(rows, k=max_samples)
@@ -411,6 +415,7 @@ class DeepLesionDataset(Dataset):
         max_samples: Optional[int] = None,
         seed: int = 1337,
         transform=None,
+        allowed_splits: Optional[list] = None,
     ):
         self.data_dir = Path(data_dir)
         resolved_csv = Path(csv_path) if csv_path else self.data_dir / "DL_info.csv"
@@ -425,6 +430,13 @@ class DeepLesionDataset(Dataset):
         with resolved_csv.open("r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
+                if allowed_splits is not None:
+                    try:
+                        split_int = int(float((row.get("Train_Val_Test") or "").strip()))
+                    except (ValueError, TypeError):
+                        continue
+                    if split_int not in allowed_splits:
+                        continue
                 file_name = (row.get("File_name") or "").strip()
                 raw_type = (row.get("Coarse_lesion_type") or "").strip()
                 if not file_name or not raw_type:

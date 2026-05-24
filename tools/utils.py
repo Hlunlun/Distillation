@@ -13,11 +13,32 @@ import torch.nn.functional as F
 import torch.utils.data
 import torchvision.transforms as T
 from PIL import Image
-from sklearn.metrics import f1_score, recall_score
+def _macro_f1_recall_specificity(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float, float]:
+    tp = ((y_true == 1) & (y_pred == 1)).sum(axis=0).astype(float)
+    fp = ((y_true == 0) & (y_pred == 1)).sum(axis=0).astype(float)
+    fn = ((y_true == 1) & (y_pred == 0)).sum(axis=0).astype(float)
+    tn = ((y_true == 0) & (y_pred == 0)).sum(axis=0).astype(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        recall = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
+        prec = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
+        f1 = np.where(prec + recall > 0, 2 * prec * recall / (prec + recall), 0.0)
+        specificity = np.where(tn + fp > 0, tn / (tn + fp), 0.0)
+    return float(np.mean(f1)), float(np.mean(recall)), float(np.mean(specificity))
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _sdpa_context():
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor >= 120:  # Blackwell consumer (SM120+): no Flash/MemEfficient kernel
+        return torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.MATH])
+    return torch.nn.attention.sdpa_kernel([
+        torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+        torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+        torch.nn.attention.SDPBackend.MATH,
+    ])
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -117,21 +138,19 @@ def _auroc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(np.trapezoid(tp, fp))
 
 
-def _fit_linear_probe(
-    X_tr: np.ndarray,
+def _train_linear_probe(
+    X_tr: torch.Tensor,
     y_tr: np.ndarray,
-    X_te: np.ndarray,
     multilabel: bool,
-    device: str,
     n_epochs: int = 30,
     lr: float = 1e-2,
     batch_size: int = 256,
-) -> np.ndarray:
+) -> torch.nn.Linear:
+    device = X_tr.device
     n, d = X_tr.shape
     n_classes = y_tr.shape[1] if multilabel else int(y_tr.max()) + 1
     linear = torch.nn.Linear(d, n_classes, bias=True).to(device)
     opt = torch.optim.Adam(linear.parameters(), lr=lr, weight_decay=1e-4)
-    X = torch.from_numpy(X_tr).float().to(device)
     y = (torch.from_numpy(y_tr).float().to(device) if multilabel
          else torch.from_numpy(y_tr).long().to(device))
     bar = tqdm(range(n_epochs), desc="probe", leave=False)
@@ -141,7 +160,7 @@ def _fit_linear_probe(
         n_batches = 0
         for i in range(0, n - batch_size + 1, batch_size):
             idx = perm[i:i + batch_size]
-            logits = linear(X[idx])
+            logits = linear(X_tr[idx])
             loss = (F.binary_cross_entropy_with_logits(logits, y[idx]) if multilabel
                     else F.cross_entropy(logits, y[idx]))
             opt.zero_grad()
@@ -150,9 +169,21 @@ def _fit_linear_probe(
             total_loss += float(loss.detach())
             n_batches += 1
         bar.set_postfix(loss=f"{total_loss / max(n_batches, 1):.4f}")
+    return linear
+
+
+def _fit_linear_probe(
+    X_tr: torch.Tensor,
+    y_tr: np.ndarray,
+    X_te: torch.Tensor,
+    multilabel: bool,
+    n_epochs: int = 30,
+    lr: float = 1e-2,
+    batch_size: int = 256,
+) -> np.ndarray:
+    linear = _train_linear_probe(X_tr, y_tr, multilabel, n_epochs, lr, batch_size)
     with torch.no_grad():
-        scores = linear(torch.from_numpy(X_te).float().to(device)).cpu().numpy()
-    return scores
+        return linear(X_te).cpu().numpy()
 
 
 def _extract_features(
@@ -160,19 +191,20 @@ def _extract_features(
     ds: torch.utils.data.Dataset,
     device: str,
     batch_size: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+) -> tuple[torch.Tensor, np.ndarray]:
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=4)
     feats, labels = [], []
-    with torch.no_grad():
+    with torch.no_grad(), _sdpa_context():
         for imgs, lbls in tqdm(loader, desc="extract", leave=False):
             f = model(imgs.to(device))
             if hasattr(f, "pooler_output"):
                 f = f.pooler_output
             elif hasattr(f, "last_hidden_state"):
                 f = f.last_hidden_state[:, 0]
-            feats.append(f.cpu().numpy())
+            torch.cuda.synchronize()
+            feats.append(f)
             labels.append(lbls.cpu().numpy() if torch.is_tensor(lbls) else np.asarray(lbls))
-    return _l2_normalize(np.concatenate(feats, 0)), np.concatenate(labels, 0)
+    return F.normalize(torch.cat(feats, 0), dim=1), np.concatenate(labels, 0)
 
 
 def _multilabel_auroc(
@@ -194,21 +226,78 @@ def _multilabel_auroc(
     if n_classes is not None:
         y_tr = np.eye(n_classes)[y_tr.astype(int)]
         y_te = np.eye(n_classes)[y_te.astype(int)]
-    scores = _fit_linear_probe(X_tr, y_tr, X_te, multilabel=True, device=device)
+    scores = _fit_linear_probe(X_tr, y_tr, X_te, multilabel=True)
     per_class = [_auroc_binary(y_te[:, k], scores[:, k]) for k in range(y_te.shape[1])]
     y_pred = (1.0 / (1.0 + np.exp(-scores)) >= 0.5).astype(int)
     y_te_int = y_te.astype(int)
+    _f1, _recall, _spec = _macro_f1_recall_specificity(y_te_int, y_pred)
     metrics = {
         "macro_auroc": float(np.nanmean(per_class)) * 100.0,
         "per_class_auroc": per_class,
         "acc": float((y_pred == y_te_int).mean()) * 100.0,
-        "macro_f1": float(f1_score(y_te_int, y_pred, average="macro", zero_division=0)) * 100.0,
-        "macro_recall": float(recall_score(y_te_int, y_pred, average="macro", zero_division=0)) * 100.0,
+        "macro_f1": _f1 * 100.0,
+        "macro_recall": _recall * 100.0,
+        "macro_specificity": _spec * 100.0,
         "dataset": dataset_name,
         "n_train": len(tr_idx),
         "n_test": len(te_idx),
     }
     return metrics, te_idx
+
+
+def _multilabel_auroc_presplit(
+    ds_train: torch.utils.data.Dataset,
+    ds_test: torch.utils.data.Dataset,
+    model: nn.Module,
+    device: str,
+    batch_size: int,
+    dataset_name: str,
+    n_classes: Optional[int] = None,
+    ds_val: Optional[torch.utils.data.Dataset] = None,
+) -> dict:
+    X_tr, y_tr = _extract_features(model, ds_train, device, batch_size)
+    X_te, y_te = _extract_features(model, ds_test, device, batch_size)
+    if n_classes is not None:
+        y_tr = np.eye(n_classes)[y_tr.astype(int)]
+        y_te = np.eye(n_classes)[y_te.astype(int)]
+
+    linear = _train_linear_probe(X_tr, y_tr, multilabel=True)
+
+    def _eval(X: torch.Tensor, y_true: np.ndarray) -> dict:
+        with torch.no_grad():
+            scores = linear(X).cpu().numpy()
+        per_class = [_auroc_binary(y_true[:, k], scores[:, k]) for k in range(y_true.shape[1])]
+        y_pred = (1.0 / (1.0 + np.exp(-scores)) >= 0.5).astype(int)
+        y_int = y_true.astype(int)
+        _f1, _recall, _spec = _macro_f1_recall_specificity(y_int, y_pred)
+        return {
+            "macro_auroc": float(np.nanmean(per_class)) * 100.0,
+            "per_class_auroc": per_class,
+            "acc": float((y_pred == y_int).mean()) * 100.0,
+            "macro_f1": _f1 * 100.0,
+            "macro_recall": _recall * 100.0,
+            "macro_specificity": _spec * 100.0,
+        }
+
+    test_m = _eval(X_te, y_te)
+    result: dict = {
+        "dataset": dataset_name,
+        "n_train": len(ds_train),
+        "n_test": len(ds_test),
+        "test": test_m,
+        **test_m,  # backward compat: top-level keys mirror test
+    }
+
+    if ds_val is not None:
+        X_val, y_val = _extract_features(model, ds_val, device, batch_size)
+        if n_classes is not None:
+            y_val = np.eye(n_classes)[y_val.astype(int)]
+        val_m = _eval(X_val, y_val)
+        result["n_val"] = len(ds_val)
+        result["val"] = val_m
+        result["val_macro_auroc"] = val_m["macro_auroc"]
+
+    return result
 
 
 def _load_raw_pil(
@@ -371,7 +460,10 @@ def run_linear_probe(
     nih_data_dir: Optional[str] = None,
     nih_csv_path: Optional[str] = None,
     nih_images_dir: Optional[str] = None,
-    chexpert_csv_path: Optional[str] = None,
+    nih14_train_val_list: Optional[str] = None,
+    nih14_test_list: Optional[str] = None,
+    chexpert_train_csv_path: Optional[str] = None,
+    chexpert_test_csv_path: Optional[str] = None,
     chexpert_images_dir: Optional[str] = None,
     chexpert_uncertain_policy: str = "zeros",
     deeplesion_data_dir: Optional[str] = None,
@@ -386,25 +478,18 @@ def run_linear_probe(
     attn_tag: Optional[str] = None,
     attn_step: int = 0,
 ) -> dict:
-    if dataset_name == "chestmnist":
-        train_ds = MedMNISTDataset("chestmnist", split="train", image_size=image_size)
-        test_ds  = MedMNISTDataset("chestmnist", split="test",  image_size=image_size)
-        X_tr, y_tr = _extract_features(model, train_ds, device, batch_size)
-        X_te, y_te = _extract_features(model, test_ds,  device, batch_size)
-        scores = _fit_linear_probe(X_tr, y_tr, X_te, multilabel=True, device=device)
-        per_class = [_auroc_binary(y_te[:, k], scores[:, k]) for k in range(y_te.shape[1])]
-        y_pred = (1.0 / (1.0 + np.exp(-scores)) >= 0.5).astype(int)
-        y_te_int = y_te.astype(int)
-        result = {
-            "macro_auroc": float(np.nanmean(per_class)) * 100.0,
-            "per_class_auroc": per_class,
-            "acc": float((y_pred == y_te_int).mean()) * 100.0,
-            "macro_f1": float(f1_score(y_te_int, y_pred, average="macro", zero_division=0)) * 100.0,
-            "macro_recall": float(recall_score(y_te_int, y_pred, average="macro", zero_division=0)) * 100.0,
-            "dataset": dataset_name,
-            "n_train": len(train_ds),
-            "n_test": len(test_ds),
-        }
+    _MEDMNIST_DATASETS = {
+        "chestmnist", "pathmnist", "dermamnist", "octmnist", "pneumoniamnist", "organamnist",
+    }
+    if dataset_name in _MEDMNIST_DATASETS:
+        train_ds = MedMNISTDataset(dataset_name, split="train", image_size=image_size)
+        val_ds   = MedMNISTDataset(dataset_name, split="val",   image_size=image_size)
+        test_ds  = MedMNISTDataset(dataset_name, split="test",  image_size=image_size)
+        n_cls = None if train_ds.multilabel else len(train_ds.label_names)
+        result = _multilabel_auroc_presplit(
+            train_ds, test_ds, model, device, batch_size, dataset_name, ds_val=val_ds,
+            n_classes=n_cls,
+        )
         if writer is not None and attn_encoder_specs:
             te_idx = list(range(min(attn_n_samples, len(test_ds))))
             _log_attn_comparison_from_probe(
@@ -417,72 +502,110 @@ def run_linear_probe(
     if dataset_name in ("nih14_auroc", "nih_cxr14_auroc"):
         if nih_data_dir is None and (nih_csv_path is None or nih_images_dir is None):
             raise ValueError("Provide nih_data_dir, or both nih_csv_path and nih_images_dir for NIH14.")
-        ds = NIHChestXray14Dataset(
+        if nih14_train_val_list is None or nih14_test_list is None:
+            raise ValueError("Provide nih14_train_val_list and nih14_test_list for NIH14 probe.")
+        all_tv_files = [l.strip() for l in Path(nih14_train_val_list).read_text().splitlines() if l.strip()]
+        test_files   = [l.strip() for l in Path(nih14_test_list).read_text().splitlines() if l.strip()]
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(len(all_tv_files))
+        n_val = max(1, int(len(all_tv_files) * 0.2))
+        val_files   = [all_tv_files[i] for i in perm[:n_val]]
+        train_files = [all_tv_files[i] for i in perm[n_val:]]
+        ds_train = NIHChestXray14Dataset(
             data_dir=nih_data_dir, csv_path=nih_csv_path, images_dir=nih_images_dir,
-            image_size=image_size, max_samples=max_samples, seed=seed, transform=image_transform,
+            image_size=image_size, max_samples=max_samples, seed=seed,
+            transform=image_transform, split_list=train_files,
         )
-        result, te_idx = _multilabel_auroc(ds, model, device, batch_size, seed, dataset_name)
+        ds_val = NIHChestXray14Dataset(
+            data_dir=nih_data_dir, csv_path=nih_csv_path, images_dir=nih_images_dir,
+            image_size=image_size, seed=seed, transform=image_transform, split_list=val_files,
+        )
+        ds_test = NIHChestXray14Dataset(
+            data_dir=nih_data_dir, csv_path=nih_csv_path, images_dir=nih_images_dir,
+            image_size=image_size, seed=seed, transform=image_transform, split_list=test_files,
+        )
+        result = _multilabel_auroc_presplit(ds_train, ds_test, model, device, batch_size, dataset_name, ds_val=ds_val)
         if writer is not None and attn_encoder_specs:
-            # BBox_List_2017.csv covers only ~880/112k images — prefer bbox images for visualization
             bbox_lookup: dict = {}
-            if ds.samples:
-                bbox_csv = Path(ds.samples[0][0]).parent.parent / "BBox_List_2017.csv"
+            if ds_test.samples:
+                bbox_csv = Path(ds_test.samples[0][0]).parent.parent / "BBox_List_2017.csv"
                 bbox_lookup = _load_nih14_bbox_lookup(bbox_csv)
+            all_te = list(range(len(ds_test.samples)))
             if bbox_lookup:
-                bbox_te = [i for i in te_idx if i < len(ds.samples) and ds.samples[i][0].name in bbox_lookup]
-                non_bbox_te = [i for i in te_idx if i not in set(bbox_te)]
+                bbox_te = [i for i in all_te if ds_test.samples[i][0].name in bbox_lookup]
+                non_bbox_te = [i for i in all_te if i not in set(bbox_te)]
                 vis_idx = (bbox_te + non_bbox_te)[:attn_n_samples]
             else:
-                vis_idx = list(te_idx[:attn_n_samples])
-            vis_paths = [ds.samples[i][0] for i in vis_idx if i < len(ds.samples)]
+                vis_idx = all_te[:attn_n_samples]
+            vis_paths = [ds_test.samples[i][0] for i in vis_idx]
             _log_attn_comparison_from_probe(
-                model, attn_encoder_specs, _load_raw_pil(ds, vis_idx, attn_n_samples),
+                model, attn_encoder_specs, _load_raw_pil(ds_test, vis_idx, attn_n_samples),
                 device, writer, attn_tag or f"attention/{dataset_name}", attn_step, attn_n_samples,
-                label_strings=_get_label_strings(ds, vis_idx),
+                label_strings=_get_label_strings(ds_test, vis_idx),
                 bbox_list=_bboxes_for_paths(vis_paths, bbox_lookup),
             )
         return result
 
     if dataset_name == "chexpert_auroc":
-        if chexpert_csv_path is None or chexpert_images_dir is None:
-            raise ValueError("Provide chexpert_csv_path and chexpert_images_dir for CheXpert linear probe.")
-        ds = CheXpertDataset(
-            images_dir=chexpert_images_dir, csv_path=chexpert_csv_path,
+        if chexpert_train_csv_path is None or chexpert_test_csv_path is None or chexpert_images_dir is None:
+            raise ValueError("Provide chexpert_train_csv_path, chexpert_test_csv_path, and chexpert_images_dir.")
+        ds_train_full = CheXpertDataset(
+            images_dir=chexpert_images_dir, csv_path=chexpert_train_csv_path,
             image_size=image_size, max_samples=max_samples, seed=seed,
             uncertain_policy=chexpert_uncertain_policy, transform=image_transform,
         )
-        result, te_idx = _multilabel_auroc(ds, model, device, batch_size, seed, dataset_name)
+        n = len(ds_train_full)
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(n).tolist()
+        n_val = max(1, int(n * 0.2))
+        ds_val   = torch.utils.data.Subset(ds_train_full, perm[:n_val])
+        ds_train = torch.utils.data.Subset(ds_train_full, perm[n_val:])
+        ds_test = CheXpertDataset(
+            images_dir=chexpert_images_dir, csv_path=chexpert_test_csv_path,
+            image_size=image_size, seed=seed,
+            uncertain_policy=chexpert_uncertain_policy, transform=image_transform,
+        )
+        result = _multilabel_auroc_presplit(ds_train, ds_test, model, device, batch_size, dataset_name, ds_val=ds_val)
         result["uncertain_policy"] = chexpert_uncertain_policy
         if writer is not None and attn_encoder_specs:
+            vis_idx = list(range(min(attn_n_samples, len(ds_test.items))))
             _log_attn_comparison_from_probe(
-                model, attn_encoder_specs, _load_raw_pil(ds, te_idx, attn_n_samples),
+                model, attn_encoder_specs, _load_raw_pil(ds_test, vis_idx, attn_n_samples),
                 device, writer, attn_tag or f"attention/{dataset_name}", attn_step, attn_n_samples,
-                label_strings=_get_label_strings(ds, te_idx[:attn_n_samples]),
+                label_strings=_get_label_strings(ds_test, vis_idx),
             )
         return result
 
     if dataset_name == "deeplesion_auroc":
         if deeplesion_data_dir is None:
             raise ValueError("Provide deeplesion_data_dir for DeepLesion linear probe.")
-        ds = DeepLesionDataset(
+        ds_split2 = DeepLesionDataset(
             data_dir=deeplesion_data_dir, csv_path=deeplesion_csv_path,
-            image_size=image_size, max_samples=max_samples, seed=seed, transform=image_transform,
+            image_size=image_size, seed=seed, transform=image_transform, allowed_splits=[2],
         )
-        result, te_idx = _multilabel_auroc(ds, model, device, batch_size, seed, dataset_name,
-                                           n_classes=len(DeepLesionDataset.LESION_TYPES))
+        n_split2 = len(ds_split2)
+        perm2 = np.random.default_rng(seed).permutation(n_split2).tolist()
+        n_val2 = max(1, int(0.2 * n_split2))
+        ds_val   = torch.utils.data.Subset(ds_split2, perm2[:n_val2])
+        ds_train = torch.utils.data.Subset(ds_split2, perm2[n_val2:])
+        ds_test = DeepLesionDataset(
+            data_dir=deeplesion_data_dir, csv_path=deeplesion_csv_path,
+            image_size=image_size, seed=seed, transform=image_transform, allowed_splits=[3],
+        )
+        result = _multilabel_auroc_presplit(ds_train, ds_test, model, device, batch_size, dataset_name,
+                                            n_classes=len(DeepLesionDataset.LESION_TYPES), ds_val=ds_val)
         if writer is not None and attn_encoder_specs:
-            te_paths = [ds.items[i][0] for i in te_idx[:attn_n_samples] if i < len(ds.items)]
-            dl_bbox_lookup = _load_deeplesion_bbox_lookup(ds.data_dir / "DL_info.csv")
-            # DeepLesion disk layout: Images_png_wn/{folder}/{slice}.png
-            # CSV key format: {folder}_{slice}.png  (e.g. 000001_01_01_109.png)
+            vis_idx = list(range(min(attn_n_samples, len(ds_test.items))))
+            te_paths = [ds_test.items[i][0] for i in vis_idx]
+            dl_bbox_lookup = _load_deeplesion_bbox_lookup(ds_test.data_dir / "DL_info.csv")
             dl_bboxes = [
                 dl_bbox_lookup.get(f"{Path(p).parent.name}_{Path(p).stem}.png", [])
                 for p in te_paths
             ]
             _log_attn_comparison_from_probe(
-                model, attn_encoder_specs, _load_raw_pil(ds, te_idx, attn_n_samples),
+                model, attn_encoder_specs, _load_raw_pil(ds_test, vis_idx, attn_n_samples),
                 device, writer, attn_tag or f"attention/{dataset_name}", attn_step, attn_n_samples,
-                label_strings=_get_label_strings(ds, te_idx[:attn_n_samples]),
+                label_strings=_get_label_strings(ds_test, vis_idx),
                 bbox_list=dl_bboxes,
             )
         return result

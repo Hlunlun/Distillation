@@ -4,10 +4,10 @@ import faulthandler
 faulthandler.enable()
 
 import os
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+# os.environ.setdefault("OMP_NUM_THREADS", "1")
+# os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("ATEN_CPU_CAPABILITY", "avx2")
 
 import argparse
@@ -18,7 +18,7 @@ import math
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -72,8 +72,9 @@ def eval_pmcqa_mc_accuracy(
     import torch
     ds = PMCQAChoicesDataset(image_dir=image_dir, csv_path=csv_path, max_samples=max_samples, seed=seed)
     loader = DataLoader(
-        ds, batch_size=batch_size, shuffle=False, num_workers=0,
-        pin_memory=False, drop_last=False,
+        ds, batch_size=batch_size, shuffle=False, num_workers=1,
+        pin_memory=False, 
+        drop_last=False,
         collate_fn=lambda ex: collate_qa(ex, teacher.preprocess)
     )
     total, correct = 0, 0
@@ -109,8 +110,9 @@ def eval_pmcoa_retrieval_r1(
     import torch
     ds = PMCOADataset(image_dir=image_dir, jsonl_path=jsonl_path, max_samples=max_samples, seed=seed)
     loader = DataLoader(
-        ds, batch_size=batch_size, shuffle=False, num_workers=0,
-        pin_memory=False, drop_last=False,
+        ds, batch_size=batch_size, shuffle=False, num_workers=1,
+        pin_memory=False, 
+        drop_last=False,
         collate_fn=lambda ex: collate_oa(ex, teacher.preprocess),
     )
     img_embs, txt_embs = [], []
@@ -140,14 +142,12 @@ def run_eval_probes(
         torch.cuda.empty_cache()
     def _log_probe(name: str, probe: dict) -> None:
         prefix = f"eval/{name}"
-        writer.add_scalar(f"{prefix}_macro_auroc", float(probe["macro_auroc"]), epoch)
-        writer.add_scalar(f"{prefix}_macro_f1",    float(probe["macro_f1"]),    epoch)
-        writer.add_scalar(f"{prefix}_macro_recall", float(probe["macro_recall"]), epoch)
-        print(
-            f"  [epoch {epoch}] {name:12s}  AUROC={probe['macro_auroc']:.2f}"
-            f"  F1={probe['macro_f1']:.2f}  Recall={probe['macro_recall']:.2f}",
-            flush=True,
-        )
+        writer.add_scalar(f"{prefix}_macro_auroc",       float(probe["macro_auroc"]),       epoch)
+        writer.add_scalar(f"{prefix}_macro_f1",          float(probe["macro_f1"]),           epoch)
+        writer.add_scalar(f"{prefix}_macro_recall",      float(probe["macro_recall"]),       epoch)
+        writer.add_scalar(f"{prefix}_macro_specificity", float(probe["macro_specificity"]),  epoch)
+        writer.add_scalar(f"{prefix}_acc",               float(probe["acc"]),                epoch)
+        print(f"  [epoch {epoch}] {name:12s}  AUROC={probe['macro_auroc']:.2f}", flush=True)
 
     nih14_probe = None
     if args.run_nih14_probe:
@@ -161,6 +161,8 @@ def run_eval_probes(
             nih_data_dir=args.nih14_dir,
             nih_csv_path=args.nih14_csv,
             nih_images_dir=args.nih14_images_dir,
+            nih14_train_val_list=args.nih14_train_val_list,
+            nih14_test_list=args.nih14_test_list,
             image_transform=teacher.preprocess,
             max_samples=args.probe_max_samples,
             seed=args.seed,
@@ -174,9 +176,11 @@ def run_eval_probes(
     chexpert_probe = None
     if (
         args.chexpert_images_dir
-        and args.chexpert_csv
+        and args.chexpert_train_csv
+        and args.chexpert_test_csv
         and Path(args.chexpert_images_dir).exists()
-        and Path(args.chexpert_csv).exists()
+        and Path(args.chexpert_train_csv).exists()
+        and Path(args.chexpert_test_csv).exists()
     ):
         print(f"  [epoch {epoch}] running CheXpert linear probe ...", flush=True)
         chexpert_probe = run_linear_probe(
@@ -186,7 +190,8 @@ def run_eval_probes(
             device=device,
             batch_size=128,
             chexpert_images_dir=args.chexpert_images_dir,
-            chexpert_csv_path=args.chexpert_csv,
+            chexpert_train_csv_path=args.chexpert_train_csv,
+            chexpert_test_csv_path=args.chexpert_test_csv,
             chexpert_uncertain_policy=args.chexpert_uncertain_policy,
             image_transform=teacher.preprocess,
             max_samples=args.probe_max_samples,
@@ -239,11 +244,40 @@ def run_eval_probes(
         )
         _log_probe("chestmnist", chestmnist_probe)
 
+    _EXTRA_MEDMNIST = [
+        ("pathmnist",      "run_pathmnist_probe"),
+        ("dermamnist",     "run_dermamnist_probe"),
+        ("octmnist",       "run_octmnist_probe"),
+        ("pneumoniamnist", "run_pneumoniamnist_probe"),
+        ("organamnist",    "run_organamnist_probe"),
+    ]
+    extra_probes: dict = {}
+    for ds_name, flag in _EXTRA_MEDMNIST:
+        if getattr(args, flag, False):
+            print(f"  [epoch {epoch}] running {ds_name} linear probe ...", flush=True)
+            p = run_linear_probe(
+                model=student,
+                dataset_name=ds_name,
+                image_size=224,
+                device=device,
+                batch_size=128,
+                seed=args.seed,
+                writer=writer,
+                attn_encoder_specs=TEACHERS,
+                attn_tag=f"attention/{ds_name}",
+                attn_step=epoch,
+            )
+            _log_probe(ds_name, p)
+            extra_probes[f"{ds_name}_probe"] = p
+        else:
+            extra_probes[f"{ds_name}_probe"] = None
+
     return {
         "nih14_probe": nih14_probe,
         "chexpert_probe": chexpert_probe,
         "deeplesion_probe": deeplesion_probe,
         "chestmnist_probe": chestmnist_probe,
+        **extra_probes,
     }
 
 
@@ -267,9 +301,9 @@ def build_loader(args: argparse.Namespace, teacher: FrozenTeacher) -> DataLoader
         ConcatDataset([oa_ds, qa_ds]),
         batch_sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=False,
+        # pin_memory=False,
         collate_fn=functools.partial(collate_combined, preprocess=preprocess),
-        persistent_workers=False,
+        # persistent_workers=False,
     )
 
 
@@ -301,6 +335,8 @@ def train_loop(
 
     best_metric = -1.0
     best_ckpt = None
+    best_epoch = -1
+    best_probe_result: dict = {}
     last_ckpt = run_dir / "last.pt"
     metrics_path = run_dir / "metrics.json"
     global_step = 0
@@ -360,14 +396,21 @@ def train_loop(
             }
             writer.add_scalar("eval/pmcoa_i2t_r1", float(vlm_eval["pmcoa_retrieval"]["pmcoa_i2t_r1"]), epoch)
 
+        def _val_metric(probe: Optional[dict]) -> Optional[float]:
+            if probe is None:
+                return None
+            return float(probe.get("val_macro_auroc") or probe.get("macro_auroc") or 0.0)
+
         tracked = None
         if probe_result["chexpert_probe"] is not None:
-            tracked = float(probe_result["chexpert_probe"]["macro_auroc"])
+            tracked = _val_metric(probe_result["chexpert_probe"])
         elif probe_result["nih14_probe"] is not None:
-            tracked = float(probe_result["nih14_probe"]["macro_auroc"])
+            tracked = _val_metric(probe_result["nih14_probe"])
 
         if tracked is not None and tracked > best_metric:
             best_metric = tracked
+            best_epoch = epoch
+            best_probe_result = probe_result
             best_ckpt = run_dir / "best.pt"
             torch.save(
                 {
@@ -397,9 +440,11 @@ def train_loop(
     writer.close()
     summary = {
         "best_metric": best_metric,
+        "best_epoch": best_epoch,
         "best_ckpt": str(best_ckpt) if best_ckpt else None,
         "run_dir": str(run_dir),
         "last_ckpt": str(last_ckpt),
+        "best_probe": best_probe_result,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary, probe_result

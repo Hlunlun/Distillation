@@ -53,12 +53,19 @@ def _method_tag(a: dict) -> str:
 
 
 def _rows_from_run(run_dir: Path) -> list[_RunRow]:
-    if not (run_dir / "summary.json").exists() or not (run_dir / "metrics.json").exists():
+    if not (run_dir / "summary.json").exists():
         return []
-    metrics = json.loads((run_dir / "metrics.json").read_text())
-    if not isinstance(metrics, list) or not metrics:
-        return []
-    last = metrics[-1]
+    summary = json.loads((run_dir / "summary.json").read_text())
+    best_probe = summary.get("best_probe")
+
+    # Fall back to last epoch of metrics.json if summary has no best_probe
+    if not best_probe:
+        if not (run_dir / "metrics.json").exists():
+            return []
+        metrics = json.loads((run_dir / "metrics.json").read_text())
+        if not isinstance(metrics, list) or not metrics:
+            return []
+        best_probe = metrics[-1]
 
     args: Optional[dict] = None
     args_json = run_dir / "args.json"
@@ -85,21 +92,31 @@ def _rows_from_run(run_dir: Path) -> list[_RunRow]:
 
     rows: list[_RunRow] = []
     for dataset, key in [
-        ("CheXpert",   "chexpert_probe"),
-        ("NIH14",      "nih14_probe"),
-        ("DeepLesion", "deeplesion_probe"),
-        ("ChestMNIST", "chestmnist_probe"),
+        ("CheXpert",      "chexpert_probe"),
+        ("NIH14",         "nih14_probe"),
+        ("DeepLesion",    "deeplesion_probe"),
+        ("ChestMNIST",    "chestmnist_probe"),
+        ("PathMNIST",     "pathmnist_probe"),
+        ("DermaMNIST",    "dermamnist_probe"),
+        ("OCTMNIST",      "octmnist_probe"),
+        ("PneumoniaMNIST","pneumoniamnist_probe"),
+        ("OrganMNIST",    "organamnist_probe"),
     ]:
-        probe = last.get(key)
-        if isinstance(probe, dict) and probe.get("macro_auroc") is not None:
-            rows.append(_RunRow(
-                time=time_str, run=run_dir.name, method=method,
-                student=student, teacher=teacher, dataset=dataset,
-                macro_auroc=float(probe["macro_auroc"]),
-                acc=float(probe["acc"]) if probe.get("acc") is not None else None,
-                macro_f1=float(probe["macro_f1"]) if probe.get("macro_f1") is not None else None,
-                macro_recall=float(probe["macro_recall"]) if probe.get("macro_recall") is not None else None,
-            ))
+        probe = best_probe.get(key)
+        if not isinstance(probe, dict):
+            continue
+        # prefer nested "test" dict (new format); fall back to top-level (old format)
+        m = probe.get("test") if isinstance(probe.get("test"), dict) else probe
+        if m.get("macro_auroc") is None:
+            continue
+        rows.append(_RunRow(
+            time=time_str, run=run_dir.name, method=method,
+            student=student, teacher=teacher, dataset=dataset,
+            macro_auroc=float(m["macro_auroc"]),
+            acc=float(m["acc"]) if m.get("acc") is not None else None,
+            macro_f1=float(m["macro_f1"]) if m.get("macro_f1") is not None else None,
+            macro_recall=float(m["macro_recall"]) if m.get("macro_recall") is not None else None,
+        ))
     return rows
 
 
@@ -113,7 +130,7 @@ def _render_results_md(results_dir: str) -> str:
     all_rows.sort(key=lambda r: (r.time, r.run, r.dataset))
 
     sota_cols = ["我用的模型", "BiomedCLIP-PubMedBERT_256-", "RadCLIP", "open-pmc-clip", "medclip-vit-base-patch16", "llava-med"]
-    datasets = ["NIH14", "CheXpert", "DeepLesion", "ChestMNIST"]
+    datasets = ["NIH14", "CheXpert", "DeepLesion", "ChestMNIST", "PathMNIST", "DermaMNIST", "OCTMNIST", "PneumoniaMNIST", "OrganMNIST"]
     best_by_ds: dict[str, Optional[_RunRow]] = {ds: None for ds in datasets}
     for r in all_rows:
         if r.dataset in best_by_ds and r.macro_auroc is not None:
@@ -157,15 +174,28 @@ def write_results_md(results_dir: str, results_md: str) -> None:
 
 
 def print_table_header() -> None:
-    print(f"\n{'Run':<{COL_W}} {'CheXpert AUROC':>14} {'NIH14 AUROC':>12} {'DeepLesion AUROC':>17} {'ChestMNIST AUROC':>17}")
-    print("-" * (COL_W + 64))
+    print(f"\n{'Run':<{COL_W}} {'CheXpert':>10} {'NIH14':>10} {'DeepLesion':>11} {'ChestMNIST':>11} {'PathMNIST':>10} {'DermaMNIST':>11} {'OCTMNIST':>9} {'PneumMNIST':>11} {'OrganMNIST':>11}")
+    print("-" * (COL_W + 97))
 
 
 def print_run_row(label: str, probe_result: dict) -> None:
     def fmt(x: Optional[float]) -> str:
         return "-" if x is None else f"{x:.4f}"
-    chex = fmt((probe_result.get("chexpert_probe")   or {}).get("macro_auroc"))
-    nih  = fmt((probe_result.get("nih14_probe")       or {}).get("macro_auroc"))
-    dl   = fmt((probe_result.get("deeplesion_probe")  or {}).get("macro_auroc"))
-    cm   = fmt((probe_result.get("chestmnist_probe")  or {}).get("macro_auroc"))
-    print(f"  {label:<{COL_W - 2}} {chex:>14} {nih:>12} {dl:>17} {cm:>17}")
+
+    def auroc(key: str) -> str:
+        p = probe_result.get(key) or {}
+        v = p.get("test", p).get("macro_auroc") if isinstance(p.get("test"), dict) else p.get("macro_auroc")
+        return fmt(v)
+
+    print(
+        f"  {label:<{COL_W - 2}}"
+        f" {auroc('chexpert_probe'):>10}"
+        f" {auroc('nih14_probe'):>10}"
+        f" {auroc('deeplesion_probe'):>11}"
+        f" {auroc('chestmnist_probe'):>11}"
+        f" {auroc('pathmnist_probe'):>10}"
+        f" {auroc('dermamnist_probe'):>11}"
+        f" {auroc('octmnist_probe'):>9}"
+        f" {auroc('pneumoniamnist_probe'):>11}"
+        f" {auroc('organamnist_probe'):>11}"
+    )

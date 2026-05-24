@@ -6,7 +6,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import nltk
+import re
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -20,6 +20,8 @@ from experiments.generated.distill_cosmos_vits16 import (
     infonce, _teacher_patch_features, _make_crop_params, _spatial_crop, _pad_sentences,
 )
 from experiments.analysis.layer_sim import analyze_layer_similarity, make_attn_hook
+
+_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -79,11 +81,6 @@ def get_probe_model(student: CosmosStudent) -> CosmosStudent:
 # ── init ─────────────────────────────────────────────────────────────────────
 
 def init(shared_args, exp_args, device):
-    try:
-        nltk.data.find("tokenizers/punkt_tab")
-    except LookupError:
-        nltk.download("punkt_tab", quiet=True)
-
     teacher = FrozenTeacher(
         shared_args.teacher_model,
         pretrained=shared_args.teacher_pretrained,
@@ -128,6 +125,8 @@ def init(shared_args, exp_args, device):
             top_k=exp_args.top_k_layers,
             save_path=save_path,
         )
+        # TODO: consider more layers or a different selection strategy based on the similarity matrix, instead of just picking the top-k most similar to the teacher's last layer. For now, we pick the first and last layers as a simple heuristic.
+        selected_layers = [0, 11]
         plt.close(fig)
         print(f"[AlignKD-COSMOS] selected layers: {selected_layers}  |  figure: {save_path}")
     else:
@@ -206,7 +205,7 @@ def init(shared_args, exp_args, device):
             # L_crop: TGAC top-K regions vs sentence-level teacher text
             K = exp_args.tgac_k
             sentences_per_sample = [
-                _pad_sentences(nltk.sent_tokenize(cap), K)
+                _pad_sentences(_SENT_SPLIT.split(cap.strip()) or [cap], K)
                 for cap in batch.captions
             ]
             flat_sents = [sentences_per_sample[b][k] for k in range(K) for b in range(B)]
