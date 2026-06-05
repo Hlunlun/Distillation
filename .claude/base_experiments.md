@@ -82,3 +82,24 @@ Run dir: `baseline_20260523_012031`
 | RadCLIP | teacher | 74.04 | 19.86 | 18.92 | 68.85 | 0.15 | 0.07 | 92.39 | 46.89 | 40.97 | 66.97 | 0.27 | 0.14 |
 | PLIP | teacher | 64.30 | 6.66 | 6.75 | 65.33 | 0.00 | 0.00 | 90.08 | 19.07 | 15.95 | 64.77 | 0.00 | 0.00 |
 | QuiltNet-B-32 | teacher | 63.63 | 5.77 | 6.43 | 64.15 | 0.00 | 0.00 | 88.65 | 12.17 | 10.67 | 63.93 | 0.00 | 0.00 |
+
+### Baseline Run — 2026-05-25 14:54
+Run dir: `baseline_20260525_143159`
+
+| Model | Type | Chex AUROC | Chex F1 | Chex Recall | NIH14 AUROC | NIH F1 | NIH Recall | DL AUROC | DL F1 | DL Recall | CM AUROC | Path AUROC | Derma AUROC | OCT AUROC | Pneu AUROC | Organ AUROC |
+|-------|------|------------|---------|-------------|-------------|--------|------------|----------|-------|-----------|----------|------------|-------------|-----------|------------|-------------|
+| BiomedCLIP ViT-B/16 | teacher | 72.39 | 13.51 | 11.16 | 66.34 | 0.04 | 0.02 | 93.20 | 48.48 | 43.37 | 72.27 | 99.07 | 89.72 | 92.73 | 98.58 | 95.65 |
+
+### Baseline Run — 2026-05-25 15:38
+Run dir: `baseline_20260525_151654`
+
+| Model | Type | Chex AUROC | Chex F1 | Chex Recall | NIH14 AUROC | NIH F1 | NIH Recall | DL AUROC | DL F1 | DL Recall | CM AUROC | Path AUROC | Derma AUROC | OCT AUROC | Pneu AUROC | Organ AUROC |
+|-------|------|------------|---------|-------------|-------------|--------|------------|----------|-------|-----------|----------|------------|-------------|-----------|------------|-------------|
+| PubMedCLIP ViT-B/32 | teacher | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - |
+
+### Baseline Run — 2026-05-25 16:01
+Run dir: `baseline_20260525_153945`
+
+| Model | Type | Chex AUROC | Chex F1 | Chex Recall | NIH14 AUROC | NIH F1 | NIH Recall | DL AUROC | DL F1 | DL Recall | CM AUROC | Path AUROC | Derma AUROC | OCT AUROC | Pneu AUROC | Organ AUROC |
+|-------|------|------------|---------|-------------|-------------|--------|------------|----------|-------|-----------|----------|------------|-------------|-----------|------------|-------------|
+| PubMedCLIP ViT-B/32 | teacher | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - |

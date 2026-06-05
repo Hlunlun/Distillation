@@ -19,66 +19,73 @@ from experiments.models import FrozenTeacher, kl_logits, CosmosStudent, TGAC
 from experiments.generated.distill_cosmos_vits16 import (
     infonce, _teacher_patch_features, _make_crop_params, _spatial_crop, _pad_sentences,
 )
+from experiments.generated.distill_alignkd_cosmos_vits16 import (
+    _get_teacher_trunk, _attn_kl_loss, _tqva_loss,
+)
 from experiments.analysis.layer_sim import analyze_layer_similarity, make_attn_hook
 
 _SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── augmentation ──────────────────────────────────────────────────────────────
 
-def _get_teacher_trunk(teacher: FrozenTeacher):
-    visual = getattr(teacher.model, "visual", None)
-    return getattr(visual, "trunk", None) if visual is not None else None
-
-
-def _attn_kl_loss(
-    s_buf: dict[int, torch.Tensor],
-    t_buf: dict[int, torch.Tensor],
-    selected_layers: list[int],
-    device: str,
+def _student_augment(
+    images: torch.Tensor,
+    intensity_scale: float,
+    intensity_shift: float,
+    p_channel_cutmix: float,
 ) -> torch.Tensor:
-    """Mean KL(teacher_attn || student_attn) over selected layers, heads averaged."""
-    if not selected_layers or not t_buf:
-        return torch.zeros((), device=device)
-    losses = []
-    for idx in selected_layers:
-        if idx not in s_buf or idx not in t_buf:
-            continue
-        s_a = s_buf[idx].float()                              # [B, H_s, N, N]
-        t_a = t_buf[idx].float()                              # [B, H_t, N, N]
-        s_mean = s_a.mean(dim=1).reshape(-1, s_a.shape[-1])  # [B*N, N]
-        t_mean = t_a.mean(dim=1).reshape(-1, t_a.shape[-1])  # [B*N, N]
-        losses.append(
-            F.kl_div(
-                (s_mean + 1e-8).log(),
-                t_mean.detach(),
-                reduction="batchmean",
-            )
-        )
-    return torch.stack(losses).mean() if losses else torch.zeros((), device=device)
+    """Apply asymmetric augmentation to student inputs (teacher always sees clean images).
 
+    intensity_scale: max multiplicative perturbation (e.g. 0.1 → scale ∈ [0.9, 1.1])
+    intensity_shift: max additive perturbation in normalised units
+    p_channel_cutmix: per-channel probability of swapping from a random other image.
+                      0.0 disables channel cutmix entirely.
+    """
+    B = images.shape[0]
+    out = images.clone()
 
-def _tqva_loss(
-    t_txt:   torch.Tensor,   # [B, D] — text query, L2-normalised, CLIP space, no grad
-    t_patch: torch.Tensor,   # [B, N, D] — teacher patches, CLIP space, no grad
-    s_patch: torch.Tensor,   # [B, N, D] — student patches, CLIP space, has grad
-) -> torch.Tensor:
-    """Text-Query-Vision Attention distillation: KL(teacher cross-attn map || student cross-attn map).
-    Both maps computed in shared CLIP space — no projection adapter needed."""
-    D = s_patch.shape[-1]
-    # cross-attention score: text query × patch keys / sqrt(D)
-    attn_t = (t_txt.unsqueeze(1) @ t_patch.float().transpose(1, 2)).squeeze(1).div(D ** 0.5).softmax(dim=-1)  # [B, N]
-    attn_s = (t_txt.unsqueeze(1) @ s_patch.float().transpose(1, 2)).squeeze(1).div(D ** 0.5).softmax(dim=-1)  # [B, N]
-    return F.kl_div((attn_s + 1e-8).log(), attn_t.detach(), reduction="batchmean")
+    # per-sample intensity scale and shift
+    scale = 1.0 + (torch.rand(B, 1, 1, 1, device=images.device) * 2 - 1) * intensity_scale
+    shift = (torch.rand(B, 1, 1, 1, device=images.device) * 2 - 1) * intensity_shift
+    out = out * scale + shift
+
+    if p_channel_cutmix > 0.0:
+        # for each (sample, channel) independently: swap that channel from a random other image
+        perm = torch.randperm(B, device=images.device)
+        # mask shape [B, C, 1, 1]: True → take channel from perm[b]-th image
+        mask = torch.rand(B, images.shape[1], 1, 1, device=images.device) < p_channel_cutmix
+        out = torch.where(mask, images[perm], out)
+
+    return out
 
 
 # ── probe model ───────────────────────────────────────────────────────────────
+
+def _attention_mask(
+    t_attn_buf: dict[int, torch.Tensor],
+    layer_idx: int,
+    H: int,
+    W: int,
+    mask_floor: float,
+) -> torch.Tensor:
+    attn = t_attn_buf[layer_idx]                      # [B, heads, N, N]
+    cls_attn = attn[:, :, 0, 1:].mean(dim=1)          # [B, 196] — CLS→patch, avg heads
+    mn = cls_attn.amin(dim=1, keepdim=True)
+    mx = cls_attn.amax(dim=1, keepdim=True)
+    cls_attn = (cls_attn - mn) / (mx - mn + 1e-6)    # [B, 196] in [0, 1]
+    B = cls_attn.shape[0]
+    n = int(cls_attn.shape[1] ** 0.5)                 # 14 for ViT-S/16 on 224px
+    spatial = cls_attn.view(B, 1, n, n)
+    mask = F.interpolate(spatial, size=(H, W), mode="bilinear", align_corners=False)
+    return mask_floor + (1.0 - mask_floor) * mask     # [mask_floor, 1.0]
+
 
 def get_probe_model(student: CosmosStudent) -> CosmosStudent:
     return student
 
 
-# ── init ─────────────────────────────────────────────────────────────────────
+# ── init ──────────────────────────────────────────────────────────────────────
 
 def init(shared_args, exp_args, device):
     teacher = FrozenTeacher(
@@ -100,7 +107,7 @@ def init(shared_args, exp_args, device):
     # ── layer-change analysis ─────────────────────────────────────────────────
     teacher_trunk = _get_teacher_trunk(teacher)
     n_blocks = len(student.backbone.blocks)
-    selected_layers: list[int] = [0, n_blocks - 1]   # default: first and last
+    selected_layers: list[int] = [0, n_blocks - 1]
 
     _has_oa = getattr(shared_args, "data_sources", "both") != "qa"
     if teacher_trunk is not None and _has_oa:
@@ -128,11 +135,11 @@ def init(shared_args, exp_args, device):
         )
         selected_layers = [0, 11]
         plt.close(fig)
-        print(f"[AlignKD-COSMOS] selected layers: {selected_layers}  |  figure: {save_path}")
+        print(f"[MedAug-COSMOS] selected layers: {selected_layers}  |  figure: {save_path}")
     else:
-        print(f"[AlignKD-COSMOS] No visual.trunk found or OA data unavailable; using default layers: {selected_layers}")
+        print(f"[MedAug-COSMOS] No visual.trunk found or OA data unavailable; using default layers: {selected_layers}")
 
-    # ── register persistent attention hooks for training ──────────────────────
+    # ── register attention hooks ──────────────────────────────────────────────
     s_attn_buf: dict[int, torch.Tensor] = {}
     t_attn_buf: dict[int, torch.Tensor] = {}
 
@@ -158,12 +165,31 @@ def init(shared_args, exp_args, device):
         images = batch.images.to(device, non_blocking=True)
         B = images.shape[0]
 
-        # forward calls trigger the registered hooks → fills s_attn_buf, t_attn_buf
-        s_cls, s_patch = student.forward_full(images)    # [B, D], [B, 196, D]
-        t_img          = teacher.encode_image(images)    # [B, D]
+        # asymmetric: student sees augmented+masked, teacher and EMA see clean
+        images_aug = _student_augment(
+            images,
+            intensity_scale=exp_args.intensity_scale,
+            intensity_shift=exp_args.intensity_shift,
+            p_channel_cutmix=exp_args.p_channel_cutmix,
+        )
+
+        # teacher runs first so t_attn_buf is populated before student forward
+        t_img = teacher.encode_image(images)                 # [B, D]  — clean
+
+        # suppress background: use teacher's deepest-layer CLS attention as spatial mask
+        if t_attn_buf:
+            attn_mask = _attention_mask(
+                t_attn_buf, selected_layers[-1],
+                images.shape[-2], images.shape[-1],
+                exp_args.mask_floor,
+            ).to(device)
+            images_aug = images_aug * attn_mask
+
+        # forward calls trigger the registered hooks
+        s_cls, s_patch = student.forward_full(images_aug)   # [B, D], [B, 196, D]
 
         with torch.no_grad():
-            ema_cls, _ = ema.forward_full(images)        # [B, D]
+            ema_cls, _ = ema.forward_full(images)            # [B, D]  — clean
 
         l_img    = (1.0 - (s_cls * t_img).sum(dim=-1)).mean()
         l_cosmos = infonce(s_cls, ema_cls, temp=args.temp)
@@ -179,15 +205,15 @@ def init(shared_args, exp_args, device):
             lam      = (t_img * t_txt).sum(dim=-1).detach().clamp(0.0, 1.0)  # [B]
             lam_mean = lam.mean()
 
-            # L_tqva: text-query-vision attention distillation (CLIP space, no adapter)
-            t_patch_clip = _teacher_patch_features(teacher, images)  # [B, 196, D] or None
+            # L_tqva: s_patch already from augmented images; t_patch_clip from clean
+            t_patch_clip = _teacher_patch_features(teacher, images)
             l_tqva = (
                 _tqva_loss(t_txt, t_patch_clip, s_patch)
                 if t_patch_clip is not None
                 else torch.zeros((), device=device)
             )
 
-            # L_lg: local-global patch distillation
+            # L_lg: s_patch from augmented forward; teacher crops from clean images
             l_lg_list = []
             for _ in range(exp_args.num_crops):
                 top, left, h, w = _make_crop_params(224, 224)
@@ -209,11 +235,11 @@ def init(shared_args, exp_args, device):
                 for cap in batch.captions
             ]
             flat_sents = [sentences_per_sample[b][k] for k in range(K) for b in range(B)]
-            t_sents    = teacher.encode_text(flat_sents).view(K, B, -1)     # [K, B, D]
+            t_sents    = teacher.encode_text(flat_sents).view(K, B, -1)
 
-            region, _  = tgac(s_patch, t_txt)                               # [B, D]
-            cos_kb     = (t_sents.detach() * region.unsqueeze(0)).sum(dim=-1)  # [K, B]
-            l_crop_raw = (1.0 - cos_kb).mean(dim=0)                         # [B]
+            region, _  = tgac(s_patch, t_txt)
+            cos_kb     = (t_sents.detach() * region.unsqueeze(0)).sum(dim=-1)
+            l_crop_raw = (1.0 - cos_kb).mean(dim=0)
             l_crop     = (lam * l_crop_raw).mean()
 
             total = (

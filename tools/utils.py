@@ -44,6 +44,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from experiments.data_loaders import (
     MedMNISTDataset, NIHChestXray14Dataset, CheXpertDataset, DeepLesionDataset,
+    LC25000Dataset, PCamDataset,
 )
 from experiments.models import (
     OpenCLIPEncoder, PthOpenCLIPEncoder, PthHFCLIPEncoder,
@@ -192,7 +193,7 @@ def _extract_features(
     device: str,
     batch_size: int,
 ) -> tuple[torch.Tensor, np.ndarray]:
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=4)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=3)
     feats, labels = [], []
     with torch.no_grad(), _sdpa_context():
         for imgs, lbls in tqdm(loader, desc="extract", leave=False):
@@ -468,6 +469,8 @@ def run_linear_probe(
     chexpert_uncertain_policy: str = "zeros",
     deeplesion_data_dir: Optional[str] = None,
     deeplesion_csv_path: Optional[str] = None,
+    lc25000_dir: Optional[str] = None,
+    pcam_dir: Optional[str] = None,
     image_transform=None,
     max_samples: Optional[int] = None,
     seed: int = 1337,
@@ -610,6 +613,39 @@ def run_linear_probe(
             )
         return result
 
+    if dataset_name in ("lc25000_lung", "lc25000_colon"):
+        if lc25000_dir is None:
+            raise ValueError("Provide lc25000_dir for LC25000 linear probe.")
+        tissue = "lung" if dataset_name == "lc25000_lung" else "colon"
+        n_classes = 3 if tissue == "lung" else 2
+        ds_train = LC25000Dataset(
+            root_dir=lc25000_dir, split="train", tissue=tissue,
+            image_size=image_size, transform=image_transform,
+        )
+        ds_test = LC25000Dataset(
+            root_dir=lc25000_dir, split="test", tissue=tissue,
+            image_size=image_size, transform=image_transform,
+        )
+        n_tr = len(ds_train)
+        perm = np.random.default_rng(seed).permutation(n_tr).tolist()
+        n_val = max(1, int(n_tr * 0.2))
+        ds_val   = torch.utils.data.Subset(ds_train, perm[:n_val])
+        ds_train = torch.utils.data.Subset(ds_train, perm[n_val:])
+        result = _multilabel_auroc_presplit(
+            ds_train, ds_test, model, device, batch_size, dataset_name,
+            n_classes=n_classes, ds_val=ds_val,
+        )
+        return result
+
+    if dataset_name == "pcam":
+        if pcam_dir is None:
+            raise ValueError("Provide pcam_dir for PCam linear probe.")
+        ds_train = PCamDataset(pcam_dir, split="train", image_size=image_size, transform=image_transform)
+        ds_val   = PCamDataset(pcam_dir, split="val",   image_size=image_size, transform=image_transform)
+        ds_test  = PCamDataset(pcam_dir, split="test",  image_size=image_size, transform=image_transform)
+        return _multilabel_auroc_presplit(ds_train, ds_test, model, device, batch_size, dataset_name,
+                                         n_classes=2, ds_val=ds_val)
+
     raise ValueError(f"Unknown dataset for linear probe: {dataset_name}")
 
 
@@ -714,10 +750,12 @@ def _extract_attn_weights(encoder: nn.Module, img_t: torch.Tensor, device: str) 
 
     try:
         if use_gradcam:
-            output = encoder(img_t)
-            if isinstance(output, tuple):
-                output = output[0]
-            output.mean().backward()
+            with torch.enable_grad():
+                img_t = img_t.detach().requires_grad_(True)
+                output = encoder(img_t)
+                if isinstance(output, tuple):
+                    output = output[0]
+                output.mean().backward()
             feat = gradcam_state["feat"]
             grad = gradcam_state["grad"]
             if feat is not None and grad is not None:

@@ -44,8 +44,7 @@ results/                 # Experiment run outputs (tb/, metrics.json, summary.js
 | Benchmark | What it measures |
 |-----------|-----------------|
 | ImageNet zero-shot Top-1 | Zero-shot visual classification |
-| COCO i2t/t2i R@1 | Cross-modal retrieval quality |
-| ROCO i2t R@1 | Radiology retrieval |
+| PMC-OA i2t/t2i R@1 | Cross-modal retrieval quality (student visual vs teacher text) |
 | PathMNIST linear probe acc | Pathology linear probe |
 | CheXpert linear probe macro AUROC | Chest X-ray multi-label AUROC (frozen visual encoder) |
 | NIH ChestX-ray14 linear probe macro AUROC | Chest X-ray multi-label AUROC (frozen visual encoder) |

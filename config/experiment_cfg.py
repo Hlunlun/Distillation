@@ -34,6 +34,14 @@ EXPERIMENTS: dict[str, dict] = {
             {"name": "w_patch",    "type": float, "default": 1.0},
         ],
     },
+    "rrc_cosmos": {
+        "module": "experiments.generated.distill_rrc_cosmos_vits16",
+        "args": [
+            {"name": "ema_momentum",  "type": float, "default": 0.999},
+            {"name": "rrc_scale_min", "type": float, "default": 0.2},
+            {"name": "rrc_scale_max", "type": float, "default": 1.0},
+        ],
+    },
     "cosmos": {
         "module": "experiments.generated.distill_cosmos_vits16",
         "args": [
@@ -57,6 +65,25 @@ EXPERIMENTS: dict[str, dict] = {
             {"name": "top_k_layers",      "type": int,   "default": 2},
             {"name": "analysis_n_images", "type": int,   "default": 128},
             {"name": "w_tqva",            "type": float, "default": 1.0},
+        ],
+    },
+    "medaug_cosmos": {
+        "module": "experiments.generated.distill_medaug_cosmos_vits16",
+        "args": [
+            {"name": "tgac_k",            "type": int,   "default": 4},
+            {"name": "num_crops",         "type": int,   "default": 2},
+            {"name": "ema_momentum",      "type": float, "default": 0.999},
+            {"name": "w_lg",              "type": float, "default": 1.0},
+            {"name": "w_crop",            "type": float, "default": 0.5},
+            {"name": "w_layer",           "type": float, "default": 1.0},
+            {"name": "top_k_layers",      "type": int,   "default": 2},
+            {"name": "analysis_n_images", "type": int,   "default": 128},
+            {"name": "w_tqva",            "type": float, "default": 1.0},
+            # ── medaug-specific ──────────────────────────────────────────────
+            {"name": "intensity_scale",   "type": float, "default": 0.1},
+            {"name": "intensity_shift",   "type": float, "default": 0.05},
+            {"name": "p_channel_cutmix",  "type": float, "default": 0.0},
+            {"name": "mask_floor",        "type": float, "default": 0.1},
         ],
     },
     "multiteacher": {
@@ -100,7 +127,8 @@ EXPERIMENTS: dict[str, dict] = {
 
 def add_shared_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--pmc_oa_image_dir", default=PATHS.pmc_oa_image_dir)
-    p.add_argument("--pmc_oa_jsonl", default=PATHS.pmc_oa_jsonl)
+    p.add_argument("--pmc_oa_train_jsonl", default=PATHS.pmc_oa_train_jsonl)
+    p.add_argument("--pmc_oa_test_jsonl",  default=PATHS.pmc_oa_test_jsonl)
     p.add_argument("--pmc_qa_image_dir", default=PATHS.pmc_qa_image_dir)
     p.add_argument("--pmc_qa_train_csv", default=PATHS.pmc_qa_train_csv)
     p.add_argument("--pmc_qa_test_csv", default=PATHS.pmc_qa_test_csv)
@@ -113,6 +141,10 @@ def add_shared_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--run_pneumoniamnist_probe", default=False, action=argparse.BooleanOptionalAction)
     p.add_argument("--run_organamnist_probe", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--deeplesion_dir", default=PATHS.deeplesion_dir)
+    p.add_argument("--run_lc25000_probe", default=True, action=argparse.BooleanOptionalAction)
+    p.add_argument("--lc25000_dir", default=PATHS.lc25000_dir)
+    p.add_argument("--run_pcam_probe", default=True, action=argparse.BooleanOptionalAction)
+    p.add_argument("--pcam_dir", default=PATHS.pcam_dir)
     p.add_argument("--nih14_dir", default=None)
     p.add_argument("--nih14_images_dir", default=PATHS.nih14_images_dir)
     p.add_argument("--nih14_csv", default=PATHS.nih14_csv)
@@ -147,6 +179,7 @@ def add_shared_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--log_dir", default="results")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--results_md", default="experiments.md")
-    p.add_argument("--run_vlm_eval", action="store_true")
+    p.add_argument("--data_sources", default="both", choices=["oa", "qa", "both"],
+        help="Training data: 'oa' (PMC-OA only), 'qa' (PMC-QA only), 'both' (default).")
+    p.add_argument("--run_vlm_eval", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--pmcqa_eval_max_samples", type=int, default=5000)
-    p.add_argument("--pmcoa_eval_samples", type=int, default=2000)

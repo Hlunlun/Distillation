@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import h5py
 import numpy as np
 import torch
 import torchvision.transforms as T
@@ -135,7 +136,7 @@ class PMCOADataset(Dataset):
         if max_samples is not None and max_samples < len(items):
             rng = random.Random(seed)
             items = rng.sample(items, k=max_samples)
-        self.items = items
+        self.items = items[:500000]
 
     def __len__(self):
         return len(self.items)
@@ -189,7 +190,7 @@ class PMCQAChoicesDataset(Dataset):
         if max_samples is not None and max_samples < len(rows):
             rng = random.Random(seed)
             rows = rng.sample(rows, k=max_samples)
-        self.rows = rows
+        self.rows = rows[:100000]
 
     def __len__(self):
         return len(self.rows)
@@ -399,6 +400,90 @@ class CheXpertDataset(Dataset):
         path, y = self.items[idx]
         image = Image.open(path).convert("RGB")
         return self.transform(image), torch.from_numpy(y)
+
+
+class LC25000Dataset(Dataset):
+    LUNG_CLASSES  = ["lung_n",   "lung_aca",   "lung_scc"]
+    COLON_CLASSES = ["colon_n",  "colon_aca"]
+
+    def __init__(
+        self,
+        root_dir: str,
+        split: str,
+        tissue: str,
+        image_size: int = 224,
+        transform=None,
+    ):
+        assert split in ("train", "test"), "split must be 'train' or 'test'"
+        assert tissue in ("lung", "colon"), "tissue must be 'lung' or 'colon'"
+        subdir = "Train_and_Validation_Set" if split == "train" else "Test_Set"
+        base = Path(root_dir) / subdir
+        if not base.exists():
+            raise FileNotFoundError(f"LC25000 {split} dir not found: {base}")
+        classes = self.LUNG_CLASSES if tissue == "lung" else self.COLON_CLASSES
+        self.label_names = classes
+        items: list[tuple[Path, int]] = []
+        for label_idx, cls_name in enumerate(classes):
+            cls_dir = base / cls_name
+            if not cls_dir.exists():
+                raise FileNotFoundError(f"LC25000 class dir not found: {cls_dir}")
+            for p in sorted(cls_dir.iterdir()):
+                if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
+                    items.append((p, label_idx))
+        if not items:
+            raise RuntimeError(f"No images found in {base} for tissue={tissue}")
+        self.items = items
+        self.transform = transform or T.Compose([
+            T.Resize(image_size),
+            T.CenterCrop(image_size),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        path, label = self.items[idx]
+        image = Image.open(path).convert("RGB")
+        return self.transform(image), torch.tensor(label, dtype=torch.long)
+
+
+class PCamDataset(Dataset):
+    _SPLIT_MAP = {
+        "train": ("training_split.h5",   "camelyonpatch_level_2_split_train_y.h5"),
+        "val":   ("validation_split.h5", "camelyonpatch_level_2_split_valid_y.h5"),
+        "test":  ("test_split.h5",        "camelyonpatch_level_2_split_test_y.h5"),
+    }
+
+    def __init__(self, data_dir: str, split: str = "train", image_size: int = 224, transform=None):
+        assert split in self._SPLIT_MAP, f"split must be one of {list(self._SPLIT_MAP)}"
+        base = Path(data_dir)
+        img_file, lbl_file = self._SPLIT_MAP[split]
+        self.img_path = base / "pcam" / img_file
+        self.lbl_path = base / "Labels" / "Labels" / lbl_file
+        for p in (self.img_path, self.lbl_path):
+            if not p.exists():
+                raise FileNotFoundError(f"PCam file not found: {p}")
+        with h5py.File(self.lbl_path, "r") as f:
+            self.labels = f["y"][:].squeeze()  # (N,) uint8
+        self.n = len(self.labels)
+        self._img_h5 = None  # opened lazily per-worker
+        self.transform = transform or T.Compose([
+            T.Resize(image_size),
+            T.CenterCrop(image_size),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        if self._img_h5 is None:
+            self._img_h5 = h5py.File(self.img_path, "r")
+        img = Image.fromarray(self._img_h5["x"][idx]).convert("RGB")
+        return self.transform(img), int(self.labels[idx])
 
 
 class DeepLesionDataset(Dataset):

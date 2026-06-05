@@ -283,7 +283,7 @@ class PthHFCLIPEncoder(nn.Module):
         try:
             proc = CLIPImageProcessor.from_pretrained(base_model_id)
             size = proc.size
-            if isinstance(size, dict):
+            if hasattr(size, 'get'):
                 image_size = size.get("shortest_edge", size.get("height", 224))
             else:
                 image_size = int(size) if size else 224
@@ -314,7 +314,7 @@ class HFCLIPEncoder(nn.Module):
         try:
             proc = CLIPImageProcessor.from_pretrained(model_id)
             size = proc.size
-            if isinstance(size, dict):
+            if hasattr(size, 'get'):
                 image_size = size.get("shortest_edge", size.get("height", 224))
             else:
                 image_size = int(size) if size else 224

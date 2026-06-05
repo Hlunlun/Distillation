@@ -122,6 +122,42 @@ def probe_model(model, preprocess, device, args, writer=None, model_name="model"
     else:
         result["chestmnist"] = None
 
+    if args.run_lc25000_probe and args.lc25000_dir and Path(args.lc25000_dir).exists():
+        for tissue_tag, ds_name in [("lung", "lc25000_lung"), ("colon", "lc25000_colon")]:
+            print(f"  Running LC25000 ({tissue_tag}) probe ...", flush=True)
+            result[ds_name] = run_linear_probe(
+                model=model,
+                dataset_name=ds_name,
+                image_size=224,
+                device=device,
+                batch_size=args.batch_size,
+                lc25000_dir=args.lc25000_dir,
+                image_transform=preprocess,
+                seed=args.seed,
+                attn_tag=f"attention/{model_name}/{ds_name}",
+                **attn_kw,
+            )
+    else:
+        result["lc25000_lung"]  = None
+        result["lc25000_colon"] = None
+
+    if args.run_pcam_probe and args.pcam_dir and Path(args.pcam_dir).exists():
+        print("  Running PCam probe ...", flush=True)
+        result["pcam"] = run_linear_probe(
+            model=model,
+            dataset_name="pcam",
+            image_size=224,
+            device=device,
+            batch_size=args.batch_size,
+            pcam_dir=args.pcam_dir,
+            image_transform=preprocess,
+            seed=args.seed,
+            attn_tag=f"attention/{model_name}/pcam",
+            **attn_kw,
+        )
+    else:
+        result["pcam"] = None
+
     _EXTRA_MEDMNIST = [
         ("pathmnist",      "run_pathmnist_probe"),
         ("dermamnist",     "run_dermamnist_probe"),
@@ -158,35 +194,52 @@ def _fmt(val) -> str:
     return str(val)
 
 
+def _ds_cols(d: dict) -> str:
+    return (
+        f"| {_fmt(d.get('macro_auroc'))} | {_fmt(d.get('acc'))} "
+        f"| {_fmt(d.get('macro_f1'))} | {_fmt(d.get('macro_recall'))} | {_fmt(d.get('macro_specificity'))} "
+    )
+
+
+_DS_NAMES = [
+    ("Chex",   "chexpert"),
+    ("NIH14",  "nih14"),
+    ("DL",     "deeplesion"),
+    ("CM",     "chestmnist"),
+    ("Path",   "pathmnist"),
+    ("Derma",  "dermamnist"),
+    ("OCT",    "octmnist"),
+    ("Pneu",   "pneumoniamnist"),
+    ("Organ",  "organamnist"),
+    ("LC-Lung",  "lc25000_lung"),
+    ("LC-Colon", "lc25000_colon"),
+    ("PCam",   "pcam"),
+]
+
+_METRIC_SUFFIX = "AUROC | {p} ACC | {p} F1 | {p} Rec | {p} Spec "
+
+
 def append_baseline_to_experiments_md(rows: list[dict], run_dir: Path) -> None:
     exp_md = _REPO_ROOT / ".claude" / "base_experiments.md"
     if not exp_md.exists():
         return
+    header_cols = "".join(
+        f"| {p} AUROC | {p} ACC | {p} F1 | {p} Rec | {p} Spec "
+        for p, _ in _DS_NAMES
+    )
+    sep_cols = "|".join(["---"] * (5 * len(_DS_NAMES)))
     lines = [
         f"\n### Baseline Run — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"Run dir: `{run_dir.name}`\n",
-        "| Model | Type | Chex AUROC | Chex F1 | Chex Recall | NIH14 AUROC | NIH F1 | NIH Recall | DL AUROC | DL F1 | DL Recall | CM AUROC | Path AUROC | Derma AUROC | OCT AUROC | Pneu AUROC | Organ AUROC |",
-        "|-------|------|------------|---------|-------------|-------------|--------|------------|----------|-------|-----------|----------|------------|-------------|-----------|------------|-------------|",
+        f"| Model | Type {header_cols}|",
+        f"|-------|------{sep_cols}|",
     ]
     for r in rows:
-        chex_d  = r.get("chexpert") or {}
-        nih_d   = r.get("nih14") or {}
-        dl_d    = r.get("deeplesion") or {}
-        cm_d    = r.get("chestmnist") or {}
-        path_d  = r.get("pathmnist") or {}
-        derm_d  = r.get("dermamnist") or {}
-        oct_d   = r.get("octmnist") or {}
-        pneu_d  = r.get("pneumoniamnist") or {}
-        org_d   = r.get("organamnist") or {}
-        lines.append(
-            f"| {r['name']} | {r['type']} "
-            f"| {_fmt(chex_d.get('macro_auroc'))} | {_fmt(chex_d.get('macro_f1'))} | {_fmt(chex_d.get('macro_recall'))} "
-            f"| {_fmt(nih_d.get('macro_auroc'))} | {_fmt(nih_d.get('macro_f1'))} | {_fmt(nih_d.get('macro_recall'))} "
-            f"| {_fmt(dl_d.get('macro_auroc'))} | {_fmt(dl_d.get('macro_f1'))} | {_fmt(dl_d.get('macro_recall'))} "
-            f"| {_fmt(cm_d.get('macro_auroc'))} | {_fmt(path_d.get('macro_auroc'))} "
-            f"| {_fmt(derm_d.get('macro_auroc'))} | {_fmt(oct_d.get('macro_auroc'))} "
-            f"| {_fmt(pneu_d.get('macro_auroc'))} | {_fmt(org_d.get('macro_auroc'))} |"
-        )
+        row = f"| {r['name']} | {r['type']} "
+        for _, key in _DS_NAMES:
+            row += _ds_cols(r.get(key) or {})
+        row += "|"
+        lines.append(row)
     with exp_md.open("a") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -221,19 +274,26 @@ def main():
 
     all_results = []
     loaded_encoders: list[tuple[str, object]] = []  # (name, encoder) for attention grid
-    col_w = 36
-
-    print(
-        f"\n{'Model':<{col_w}} {'Chex AUROC':>10} {'Chex F1':>8} {'Chex Rec':>9} "
-        f"{'NIH14 AUROC':>11} {'NIH F1':>7} {'NIH Rec':>8} "
-        f"{'DL AUROC':>9} {'DL F1':>6} {'DL Rec':>7} "
-        f"{'CM AUROC':>9} {'Path':>7} {'Derma':>7} {'OCT':>7} {'Pneu':>7} {'Organ':>7}"
-    )
-    print("-" * (col_w + 122))
+    _PRINT_DATASETS = [
+        ("CheXpert",   "chexpert"),
+        ("NIH14",      "nih14"),
+        ("DeepLesion", "deeplesion"),
+        ("ChestMNIST", "chestmnist"),
+        ("PathMNIST",  "pathmnist"),
+        ("DermaMNIST", "dermamnist"),
+        ("OCT-MNIST",  "octmnist"),
+        ("PneuMNIST",  "pneumoniamnist"),
+        ("OrganMNIST", "organamnist"),
+        ("LC25k-Lung", "lc25000_lung"),
+        ("LC25k-Colon","lc25000_colon"),
+        ("PCam",       "pcam"),
+    ]
+    _DS_HDR = f"  {'Dataset':<14} {'AUROC':>7} {'ACC':>7} {'F1':>7} {'Rec':>7} {'Spec':>7}"
+    _DS_SEP = "  " + "-" * 51
 
     for spec in models_to_run:
         name = spec["name"]
-        print(f"  Loading {name} ...", flush=True)
+        print(f"\n  Loading {name} ...", flush=True)
         model_result = {"name": name, "type": spec["type"], "model_id": spec["model_id"]}
         try:
             enc = load_encoder(spec, device=device)
@@ -245,8 +305,6 @@ def main():
         except Exception as e:
             print(f"  FAILED: {e}")
             model_result["error"] = str(e)
-            model_result["chexpert"] = None
-            model_result["nih14"] = None
 
         torch.cuda.synchronize()
         gc.collect()
@@ -254,24 +312,19 @@ def main():
 
         all_results.append(model_result)
 
-        chex_d  = model_result.get("chexpert") or {}
-        nih_d   = model_result.get("nih14") or {}
-        dl_d    = model_result.get("deeplesion") or {}
-        cm_d    = model_result.get("chestmnist") or {}
-        path_d  = model_result.get("pathmnist") or {}
-        derm_d  = model_result.get("dermamnist") or {}
-        oct_d   = model_result.get("octmnist") or {}
-        pneu_d  = model_result.get("pneumoniamnist") or {}
-        org_d   = model_result.get("organamnist") or {}
-        print(
-            f"  {name:<{col_w-2}} "
-            f"{_fmt(chex_d.get('macro_auroc')):>10} {_fmt(chex_d.get('macro_f1')):>8} {_fmt(chex_d.get('macro_recall')):>9} "
-            f"{_fmt(nih_d.get('macro_auroc')):>11} {_fmt(nih_d.get('macro_f1')):>7} {_fmt(nih_d.get('macro_recall')):>8} "
-            f"{_fmt(dl_d.get('macro_auroc')):>9} {_fmt(dl_d.get('macro_f1')):>6} {_fmt(dl_d.get('macro_recall')):>7} "
-            f"{_fmt(cm_d.get('macro_auroc')):>9} "
-            f"{_fmt(path_d.get('macro_auroc')):>7} {_fmt(derm_d.get('macro_auroc')):>7} "
-            f"{_fmt(oct_d.get('macro_auroc')):>7} {_fmt(pneu_d.get('macro_auroc')):>7} {_fmt(org_d.get('macro_auroc')):>7}"
-        )
+        print(f"  {'─'*51}")
+        print(_DS_HDR)
+        print(_DS_SEP)
+        for label, key in _PRINT_DATASETS:
+            d = model_result.get(key) or {}
+            if not d:
+                continue
+            print(
+                f"  {label:<14} "
+                f"{_fmt(d.get('macro_auroc')):>7} {_fmt(d.get('acc')):>7} "
+                f"{_fmt(d.get('macro_f1')):>7} {_fmt(d.get('macro_recall')):>7} "
+                f"{_fmt(d.get('macro_specificity')):>7}"
+            )
         (run_dir / "metrics.json").write_text(json.dumps(all_results, indent=2))
 
     (run_dir / "metrics.json").write_text(json.dumps(all_results, indent=2))

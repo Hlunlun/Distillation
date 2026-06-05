@@ -11,6 +11,24 @@ import torch
 
 COL_W = 42
 
+PROBE_DATASETS: list[tuple[str, str]] = [
+    ("CheXpert",       "chexpert_probe"),
+    ("NIH14",          "nih14_probe"),
+    ("DeepLesion",     "deeplesion_probe"),
+    ("ChestMNIST",     "chestmnist_probe"),
+    ("PathMNIST",      "pathmnist_probe"),
+    ("DermaMNIST",     "dermamnist_probe"),
+    ("OCTMNIST",       "octmnist_probe"),
+    ("PneumoniaMNIST", "pneumoniamnist_probe"),
+    ("OrganMNIST",     "organamnist_probe"),
+    ("PCam",           "pcam_probe"),
+    ("LC25000-Lung",   "lc25000_lung_probe"),
+    ("LC25000-Colon",  "lc25000_colon_probe"),
+]
+
+PMC_FIELDS = ("pmcoa_i2t_r1", "pmcoa_i2t_r5", "pmcoa_i2t_r10",
+              "pmcoa_t2i_r1", "pmcoa_t2i_r5", "pmcoa_t2i_r10")
+
 
 @dataclass
 class _RunRow:
@@ -24,6 +42,19 @@ class _RunRow:
     acc: Optional[float]
     macro_f1: Optional[float]
     macro_recall: Optional[float]
+    macro_specificity: Optional[float]
+
+
+@dataclass
+class _PMCRow:
+    time: str
+    run: str
+    i2t_r1: Optional[float]
+    i2t_r5: Optional[float]
+    i2t_r10: Optional[float]
+    t2i_r1: Optional[float]
+    t2i_r5: Optional[float]
+    t2i_r10: Optional[float]
 
 
 def _infer_time(run_name: str) -> str:
@@ -52,101 +83,145 @@ def _method_tag(a: dict) -> str:
     return "+".join(tags) + (f" ({', '.join(knobs)})" if knobs else "")
 
 
-def _rows_from_run(run_dir: Path) -> list[_RunRow]:
-    if not (run_dir / "summary.json").exists():
-        return []
-    summary = json.loads((run_dir / "summary.json").read_text())
-    best_probe = summary.get("best_probe")
-
-    # Fall back to last epoch of metrics.json if summary has no best_probe
-    if not best_probe:
-        if not (run_dir / "metrics.json").exists():
-            return []
-        metrics = json.loads((run_dir / "metrics.json").read_text())
-        if not isinstance(metrics, list) or not metrics:
-            return []
-        best_probe = metrics[-1]
-
-    args: Optional[dict] = None
+def _load_args(run_dir: Path) -> dict:
     args_json = run_dir / "args.json"
     if args_json.exists():
-        args = json.loads(args_json.read_text())
-    if args is None:
-        for ckpt_name in ("last.pt", "best.pt"):
-            ckpt_path = run_dir / ckpt_name
-            if ckpt_path.exists():
-                try:
-                    ckpt = torch.load(ckpt_path, map_location="cpu")
-                    if isinstance(ckpt, dict) and isinstance(ckpt.get("args"), dict):
-                        args = ckpt["args"]
-                        break
-                except Exception:
-                    pass
-    if not isinstance(args, dict):
-        args = {}
+        return json.loads(args_json.read_text())
+    for ckpt_name in ("last.pt", "best.pt"):
+        ckpt_path = run_dir / ckpt_name
+        if ckpt_path.exists():
+            try:
+                ckpt = torch.load(ckpt_path, map_location="cpu")
+                if isinstance(ckpt, dict) and isinstance(ckpt.get("args"), dict):
+                    return ckpt["args"]
+            except Exception:
+                pass
+    return {}
 
+
+def _rows_from_run(run_dir: Path) -> tuple[list[_RunRow], Optional[_PMCRow]]:
+    metrics_path = run_dir / "metrics.json"
+    if not metrics_path.exists():
+        return [], None
+
+    try:
+        metrics = json.loads(metrics_path.read_text())
+        if not isinstance(metrics, list) or not metrics:
+            return [], None
+    except Exception:
+        return [], None
+
+    # per-dataset, per-metric best across all epochs
+    probe_best: dict[str, dict[str, float]] = {}
+    pmc_best:   dict[str, float] = {}
+
+    for epoch_data in metrics:
+        for probe_key in (k for k in epoch_data if k.endswith("_probe")):
+            val = epoch_data[probe_key]
+            if not isinstance(val, dict):
+                continue
+            m = val.get("test") if isinstance(val.get("test"), dict) else val
+            if probe_key not in probe_best:
+                probe_best[probe_key] = {}
+            for field in ("macro_auroc", "macro_f1", "macro_recall", "macro_specificity", "acc"):
+                v = m.get(field)
+                if v is not None and v > probe_best[probe_key].get(field, -1.0):
+                    probe_best[probe_key][field] = float(v)
+
+        ret = ((epoch_data.get("vlm_eval") or {}).get("pmcoa_retrieval") or {})
+        for field in PMC_FIELDS:
+            v = ret.get(field)
+            if v is not None and v > pmc_best.get(field, -1.0):
+                pmc_best[field] = float(v)
+
+    args = _load_args(run_dir)
     time_str = _infer_time(run_dir.name)
-    method = _method_tag(args)
+    method  = _method_tag(args)
     student = str(args.get("timm_student", "-"))
     teacher = str(args.get("teacher_model", "-"))
 
     rows: list[_RunRow] = []
-    for dataset, key in [
-        ("CheXpert",      "chexpert_probe"),
-        ("NIH14",         "nih14_probe"),
-        ("DeepLesion",    "deeplesion_probe"),
-        ("ChestMNIST",    "chestmnist_probe"),
-        ("PathMNIST",     "pathmnist_probe"),
-        ("DermaMNIST",    "dermamnist_probe"),
-        ("OCTMNIST",      "octmnist_probe"),
-        ("PneumoniaMNIST","pneumoniamnist_probe"),
-        ("OrganMNIST",    "organamnist_probe"),
-    ]:
-        probe = best_probe.get(key)
-        if not isinstance(probe, dict):
-            continue
-        # prefer nested "test" dict (new format); fall back to top-level (old format)
-        m = probe.get("test") if isinstance(probe.get("test"), dict) else probe
-        if m.get("macro_auroc") is None:
+    for dataset, probe_key in PROBE_DATASETS:
+        bests = probe_best.get(probe_key)
+        if not bests or bests.get("macro_auroc") is None:
             continue
         rows.append(_RunRow(
             time=time_str, run=run_dir.name, method=method,
             student=student, teacher=teacher, dataset=dataset,
-            macro_auroc=float(m["macro_auroc"]),
-            acc=float(m["acc"]) if m.get("acc") is not None else None,
-            macro_f1=float(m["macro_f1"]) if m.get("macro_f1") is not None else None,
-            macro_recall=float(m["macro_recall"]) if m.get("macro_recall") is not None else None,
+            macro_auroc=bests.get("macro_auroc"),
+            acc=bests.get("acc"),
+            macro_f1=bests.get("macro_f1"),
+            macro_recall=bests.get("macro_recall"),
+            macro_specificity=bests.get("macro_specificity"),
         ))
-    return rows
+
+    pmc_row: Optional[_PMCRow] = None
+    if pmc_best:
+        pmc_row = _PMCRow(
+            time=time_str, run=run_dir.name,
+            i2t_r1=pmc_best.get("pmcoa_i2t_r1"),
+            i2t_r5=pmc_best.get("pmcoa_i2t_r5"),
+            i2t_r10=pmc_best.get("pmcoa_i2t_r10"),
+            t2i_r1=pmc_best.get("pmcoa_t2i_r1"),
+            t2i_r5=pmc_best.get("pmcoa_t2i_r5"),
+            t2i_r10=pmc_best.get("pmcoa_t2i_r10"),
+        )
+
+    return rows, pmc_row
 
 
 def _render_results_md(results_dir: str) -> str:
     rd = Path(results_dir)
-    all_rows: list[_RunRow] = []
+    all_rows:    list[_RunRow] = []
+    all_pmc:     list[_PMCRow] = []
+
     if rd.exists():
         for d in sorted(rd.iterdir()):
             if d.is_dir():
-                all_rows.extend(_rows_from_run(d))
-    all_rows.sort(key=lambda r: (r.time, r.run, r.dataset))
+                rows, pmc_row = _rows_from_run(d)
+                all_rows.extend(rows)
+                if pmc_row is not None:
+                    all_pmc.append(pmc_row)
 
+    all_rows.sort(key=lambda r: (r.time, r.run, r.dataset))
+    all_pmc.sort(key=lambda r: (r.time, r.run))
+
+    def fv(x: Optional[float]) -> str:
+        return "-" if x is None else f"{x:.2f}"
+
+    # ── probe experiments table ───────────────────────────────────────────────
+    probe_header = "|time|run|method|student|teacher|dataset|auroc|acc|f1|recall|specificity|\n|---|---|---|---|---|---|---:|---:|---:|---:|---:|"
+    if all_rows:
+        probe_body = "\n".join(
+            f"|{r.time}|{r.run}|{r.method}|{r.student}|{r.teacher}|{r.dataset}"
+            f"|{fv(r.macro_auroc)}|{fv(r.acc)}|{fv(r.macro_f1)}|{fv(r.macro_recall)}|{fv(r.macro_specificity)}|"
+            for r in all_rows
+        )
+        runs_table = probe_header + "\n" + probe_body
+    else:
+        runs_table = "_No experiment results found yet._"
+
+    # ── PMC-OA retrieval table ────────────────────────────────────────────────
+    pmc_header = "|time|run|i2t_r1|i2t_r5|i2t_r10|t2i_r1|t2i_r5|t2i_r10|\n|---|---|---:|---:|---:|---:|---:|---:|"
+    if all_pmc:
+        pmc_body = "\n".join(
+            f"|{r.time}|{r.run}|{fv(r.i2t_r1)}|{fv(r.i2t_r5)}|{fv(r.i2t_r10)}"
+            f"|{fv(r.t2i_r1)}|{fv(r.t2i_r5)}|{fv(r.t2i_r10)}|"
+            for r in all_pmc
+        )
+        pmc_table = pmc_header + "\n" + pmc_body
+    else:
+        pmc_table = "_No PMC-OA retrieval results yet._"
+
+    # ── SOTA comparison (best auroc per dataset) ──────────────────────────────
     sota_cols = ["我用的模型", "BiomedCLIP-PubMedBERT_256-", "RadCLIP", "open-pmc-clip", "medclip-vit-base-patch16", "llava-med"]
-    datasets = ["NIH14", "CheXpert", "DeepLesion", "ChestMNIST", "PathMNIST", "DermaMNIST", "OCTMNIST", "PneumoniaMNIST", "OrganMNIST"]
+    datasets  = [d for d, _ in PROBE_DATASETS]
     best_by_ds: dict[str, Optional[_RunRow]] = {ds: None for ds in datasets}
     for r in all_rows:
         if r.dataset in best_by_ds and r.macro_auroc is not None:
             cur = best_by_ds[r.dataset]
             if cur is None or r.macro_auroc > (cur.macro_auroc or 0.0):
                 best_by_ds[r.dataset] = r
-
-    def fau(x: Optional[float]) -> str:
-        return "-" if x is None else f"{x:.2f}"
-
-    runs_table = "|time|run|method|student|teacher|dataset|macro_auroc|acc|macro_f1|macro_recall|\n|---|---|---|---|---|---|---:|---:|---:|---:|"
-    if all_rows:
-        runs_table += "\n" + "\n".join(
-            f"|{r.time}|{r.run}|{r.method}|{r.student}|{r.teacher}|{r.dataset}|{fau(r.macro_auroc)}|{fau(r.acc)}|{fau(r.macro_f1)}|{fau(r.macro_recall)}|"
-            for r in all_rows
-        )
 
     sota_header = "|" + "|".join(["資料集", *sota_cols]) + "|\n|" + "|".join(["---"] * (len(sota_cols) + 1)) + "|"
     sota_rows = []
@@ -159,12 +234,15 @@ def _render_results_md(results_dir: str) -> str:
     return "\n".join([
         "# Results", "",
         "## Experiments", "",
-        runs_table if all_rows else "_No experiment results found yet._", "",
+        runs_table, "",
+        "## PMC-OA Retrieval", "",
+        pmc_table, "",
         "## SOTA Comparison (Linear Probe AUROC)", "",
         sota_table, "",
         "## Notes", "",
         "- Baseline columns stay `-` until you run probes for those teacher models.",
         "- `我用的模型` is the best distilled run found under `results/` for each dataset.",
+        "- All metrics are per-dataset per-metric best across all epochs (epochs may differ).",
     ]) + "\n"
 
 
@@ -174,28 +252,17 @@ def write_results_md(results_dir: str, results_md: str) -> None:
 
 
 def print_table_header() -> None:
-    print(f"\n{'Run':<{COL_W}} {'CheXpert':>10} {'NIH14':>10} {'DeepLesion':>11} {'ChestMNIST':>11} {'PathMNIST':>10} {'DermaMNIST':>11} {'OCTMNIST':>9} {'PneumMNIST':>11} {'OrganMNIST':>11}")
-    print("-" * (COL_W + 97))
+    datasets = [d for d, _ in PROBE_DATASETS]
+    header = f"{'Run':<{COL_W}}" + "".join(f" {d[:10]:>11}" for d in datasets)
+    print(f"\n{header}")
+    print("-" * len(header))
 
 
 def print_run_row(label: str, probe_result: dict) -> None:
-    def fmt(x: Optional[float]) -> str:
-        return "-" if x is None else f"{x:.4f}"
-
     def auroc(key: str) -> str:
         p = probe_result.get(key) or {}
         v = p.get("test", p).get("macro_auroc") if isinstance(p.get("test"), dict) else p.get("macro_auroc")
-        return fmt(v)
+        return "-" if v is None else f"{v:.4f}"
 
-    print(
-        f"  {label:<{COL_W - 2}}"
-        f" {auroc('chexpert_probe'):>10}"
-        f" {auroc('nih14_probe'):>10}"
-        f" {auroc('deeplesion_probe'):>11}"
-        f" {auroc('chestmnist_probe'):>11}"
-        f" {auroc('pathmnist_probe'):>10}"
-        f" {auroc('dermamnist_probe'):>11}"
-        f" {auroc('octmnist_probe'):>9}"
-        f" {auroc('pneumoniamnist_probe'):>11}"
-        f" {auroc('organamnist_probe'):>11}"
-    )
+    values = "".join(f" {auroc(probe_key):>11}" for _, probe_key in PROBE_DATASETS)
+    print(f"  {label:<{COL_W - 2}}{values}")

@@ -39,6 +39,36 @@ TEACHERS: list[dict] = [
         "loader": "open_clip",
         "model_id": "hf-hub:wisdomik/QuiltNet-B-32",
     },
+    {
+        "name": "CLIP ViT-B/16 (OpenAI)",
+        "type": "teacher",
+        "loader": "hf_clip",
+        "model_id": "openai/clip-vit-base-patch16",
+    },
+    {
+        "name": "CLIP ViT-L/14 (OpenAI)",
+        "type": "teacher",
+        "loader": "hf_clip",
+        "model_id": "openai/clip-vit-large-patch14",
+    },
+    {
+        "name": "CLIP ViT-B/32 (LAION-2B)",
+        "type": "teacher",
+        "loader": "open_clip",
+        "model_id": "hf-hub:laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
+    },
+    {
+        "name": "ResNet-50 (ImageNet)",
+        "type": "student",
+        "loader": "timm",
+        "model_id": "resnet50",
+    },
+    {
+        "name": "ResNet-18 (ImageNet)",
+        "type": "student",
+        "loader": "timm",
+        "model_id": "resnet18",
+    },
 ]
 
 STUDENT: dict = {
@@ -58,6 +88,8 @@ def add_baseline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--deeplesion_dir", default=PATHS.deeplesion_dir)
     p.add_argument("--deeplesion_csv", default=None)
     p.add_argument("--run_deeplesion_probe", default=True, action=argparse.BooleanOptionalAction)
+    p.add_argument("--run_lc25000_probe", default=True, action=argparse.BooleanOptionalAction)
+    p.add_argument("--lc25000_dir", default=PATHS.lc25000_dir)
     p.add_argument("--run_chestmnist_probe", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--run_pathmnist_probe", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--run_dermamnist_probe", default=True, action=argparse.BooleanOptionalAction)
@@ -69,8 +101,10 @@ def add_baseline_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--nih14_csv", default=PATHS.nih14_csv)
     p.add_argument("--nih14_train_val_list", default=PATHS.nih14_train_val_list)
     p.add_argument("--nih14_test_list", default=PATHS.nih14_test_list)
+    p.add_argument("--pcam_dir", default=PATHS.pcam_dir)
+    p.add_argument("--run_pcam_probe", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--probe_max_samples", type=int, default=50000)
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=1024)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--log_dir", default="results")
     p.add_argument("--only", default="", help="Comma-separated model names to run (substring match).")

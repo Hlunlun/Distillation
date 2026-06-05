@@ -4,7 +4,7 @@ import faulthandler
 faulthandler.enable()
 
 import os
-# os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
 # os.environ.setdefault("OMP_NUM_THREADS", "1")
 # os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -97,22 +97,20 @@ def eval_pmcqa_mc_accuracy(
 
 
 @torch.no_grad()
-def eval_pmcoa_retrieval_r1(
+def eval_pmcoa_retrieval(
     student: nn.Module,
     teacher: FrozenTeacher,
     image_dir: str,
     jsonl_path: str,
-    max_samples: int,
     batch_size: int,
     device: str,
     seed: int,
+    retrieval_chunk_size: int = 512,
 ) -> dict:
-    import torch
-    ds = PMCOADataset(image_dir=image_dir, jsonl_path=jsonl_path, max_samples=max_samples, seed=seed)
+    ds = PMCOADataset(image_dir=image_dir, jsonl_path=jsonl_path, seed=seed)
     loader = DataLoader(
-        ds, batch_size=batch_size, shuffle=False, num_workers=1,
-        pin_memory=False, 
-        drop_last=False,
+        ds, batch_size=batch_size, shuffle=False, num_workers=4,
+        pin_memory=True, drop_last=False,
         collate_fn=lambda ex: collate_oa(ex, teacher.preprocess),
     )
     img_embs, txt_embs = [], []
@@ -120,13 +118,29 @@ def eval_pmcoa_retrieval_r1(
         images = batch.images.to(device, non_blocking=True)
         img_embs.append(student(images).cpu())
         txt_embs.append(teacher.encode_text(batch.captions).cpu())
-    I = torch.cat(img_embs, dim=0)
-    T_emb = torch.cat(txt_embs, dim=0)
-    sims = I @ T_emb.t()
-    ranks = sims.argsort(dim=-1, descending=True)
-    gt = torch.arange(sims.shape[0]).unsqueeze(1)
-    r1 = float((ranks[:, :1] == gt).float().mean().item() * 100.0)
-    return {"pmcoa_i2t_r1": r1, "n": int(sims.shape[0])}
+    I = torch.cat(img_embs, dim=0).half().to(device)
+    T = torch.cat(txt_embs, dim=0).half().to(device)
+    N = I.shape[0]
+    max_k = 10
+    hits_i2t = {k: 0 for k in (1, 5, 10)}
+    hits_t2i = {k: 0 for k in (1, 5, 10)}
+    for i in range(0, N, retrieval_chunk_size):
+        q = I[i:i + retrieval_chunk_size] @ T.t()
+        gt = torch.arange(i, i + q.shape[0], device=device)
+        topk = q.topk(max_k, dim=1).indices
+        for k in (1, 5, 10):
+            hits_i2t[k] += int((topk[:, :k] == gt.unsqueeze(1)).any(dim=1).sum().item())
+    for i in range(0, N, retrieval_chunk_size):
+        q = T[i:i + retrieval_chunk_size] @ I.t()
+        gt = torch.arange(i, i + q.shape[0], device=device)
+        topk = q.topk(max_k, dim=1).indices
+        for k in (1, 5, 10):
+            hits_t2i[k] += int((topk[:, :k] == gt.unsqueeze(1)).any(dim=1).sum().item())
+    results: dict = {"n": N}
+    for k in (1, 5, 10):
+        results[f"pmcoa_i2t_r{k}"] = hits_i2t[k] / N * 100.0
+        results[f"pmcoa_t2i_r{k}"] = hits_t2i[k] / N * 100.0
+    return results
 
 
 def run_eval_probes(
@@ -272,11 +286,60 @@ def run_eval_probes(
         else:
             extra_probes[f"{ds_name}_probe"] = None
 
+    lc25000_lung_probe = None
+    lc25000_colon_probe = None
+    if getattr(args, "run_lc25000_probe", False) and getattr(args, "lc25000_dir", None) and Path(args.lc25000_dir).exists():
+        for tissue in ("lung", "colon"):
+            print(f"  [epoch {epoch}] running LC25000-{tissue} linear probe ...", flush=True)
+            p = run_linear_probe(
+                model=student,
+                dataset_name=f"lc25000_{tissue}",
+                image_size=224,
+                device=device,
+                batch_size=128,
+                lc25000_dir=args.lc25000_dir,
+                image_transform=teacher.preprocess,
+                max_samples=args.probe_max_samples,
+                seed=args.seed,
+                writer=writer,
+                attn_encoder_specs=TEACHERS,
+                attn_tag=f"attention/lc25000_{tissue}",
+                attn_step=epoch,
+            )
+            _log_probe(f"lc25000_{tissue}", p)
+            if tissue == "lung":
+                lc25000_lung_probe = p
+            else:
+                lc25000_colon_probe = p
+
+    pcam_probe = None
+    if getattr(args, "run_pcam_probe", False) and getattr(args, "pcam_dir", None) and Path(args.pcam_dir).exists():
+        print(f"  [epoch {epoch}] running PCam linear probe ...", flush=True)
+        pcam_probe = run_linear_probe(
+            model=student,
+            dataset_name="pcam",
+            image_size=224,
+            device=device,
+            batch_size=128,
+            pcam_dir=args.pcam_dir,
+            image_transform=teacher.preprocess,
+            max_samples=args.probe_max_samples,
+            seed=args.seed,
+            writer=writer,
+            attn_encoder_specs=TEACHERS,
+            attn_tag="attention/pcam",
+            attn_step=epoch,
+        )
+        _log_probe("pcam", pcam_probe)
+
     return {
         "nih14_probe": nih14_probe,
         "chexpert_probe": chexpert_probe,
         "deeplesion_probe": deeplesion_probe,
         "chestmnist_probe": chestmnist_probe,
+        "lc25000_lung_probe": lc25000_lung_probe,
+        "lc25000_colon_probe": lc25000_colon_probe,
+        "pcam_probe": pcam_probe,
         **extra_probes,
     }
 
@@ -292,19 +355,42 @@ def make_run_dir(root: str, name: str) -> Path:
 
 
 def build_loader(args: argparse.Namespace, teacher: FrozenTeacher) -> DataLoader:
-    from torch.utils.data import ConcatDataset
-    oa_ds = PMCOADataset(image_dir=args.pmc_oa_image_dir, jsonl_path=args.pmc_oa_jsonl, seed=args.seed)
-    qa_ds = PMCQAChoicesDataset(image_dir=args.pmc_qa_image_dir, csv_path=args.pmc_qa_train_csv, seed=args.seed)
-    sampler = HomogeneousBatchSampler(len(oa_ds), len(qa_ds), args.batch_size, seed=args.seed)
+    from torch.utils.data import ConcatDataset, BatchSampler, RandomSampler
     preprocess = teacher.preprocess
-    return DataLoader(
-        ConcatDataset([oa_ds, qa_ds]),
-        batch_sampler=sampler,
-        num_workers=args.num_workers,
-        # pin_memory=False,
-        collate_fn=functools.partial(collate_combined, preprocess=preprocess),
-        # persistent_workers=False,
-    )
+    src = getattr(args, "data_sources", "both")
+
+    if src == "oa":
+        ds = PMCOADataset(image_dir=args.pmc_oa_image_dir, jsonl_path=args.pmc_oa_train_jsonl, seed=args.seed)
+        print(f"Building loader with {len(ds)} OA samples only.")
+        return DataLoader(
+            ds,
+            batch_sampler=BatchSampler(RandomSampler(ds), batch_size=args.batch_size, drop_last=True),
+            num_workers=args.num_workers,
+            multiprocessing_context='spawn' if args.num_workers > 0 else None,
+            collate_fn=functools.partial(collate_oa, preprocess=preprocess),
+        )
+    elif src == "qa":
+        ds = PMCQAChoicesDataset(image_dir=args.pmc_qa_image_dir, csv_path=args.pmc_qa_train_csv, seed=args.seed)
+        print(f"Building loader with {len(ds)} QA samples only.")
+        return DataLoader(
+            ds,
+            batch_sampler=BatchSampler(RandomSampler(ds), batch_size=args.batch_size, drop_last=True),
+            num_workers=args.num_workers,
+            multiprocessing_context='spawn' if args.num_workers > 0 else None,
+            collate_fn=functools.partial(collate_qa, preprocess=preprocess),
+        )
+    else:
+        oa_ds = PMCOADataset(image_dir=args.pmc_oa_image_dir, jsonl_path=args.pmc_oa_train_jsonl, seed=args.seed)
+        qa_ds = PMCQAChoicesDataset(image_dir=args.pmc_qa_image_dir, csv_path=args.pmc_qa_train_csv, seed=args.seed)
+        sampler = HomogeneousBatchSampler(len(oa_ds), len(qa_ds), args.batch_size, seed=args.seed)
+        print(f"Building loader with {len(oa_ds)} OA samples and {len(qa_ds)} QA samples.")
+        return DataLoader(
+            ConcatDataset([oa_ds, qa_ds]),
+            batch_sampler=sampler,
+            num_workers=args.num_workers,
+            multiprocessing_context='spawn' if args.num_workers > 0 else None,
+            collate_fn=functools.partial(collate_combined, preprocess=preprocess),
+        )
 
 
 def train_loop(
@@ -337,6 +423,7 @@ def train_loop(
     best_ckpt = None
     best_epoch = -1
     best_probe_result: dict = {}
+    best_per_dataset: dict = {}  # dataset_key -> {"epoch": int, "metric": float, "probe": dict}
     last_ckpt = run_dir / "last.pt"
     metrics_path = run_dir / "metrics.json"
     global_step = 0
@@ -383,23 +470,30 @@ def train_loop(
         if args.run_vlm_eval:
             vlm_eval = {
                 "pmcqa_test": pmcqa_eval,
-                "pmcoa_retrieval": eval_pmcoa_retrieval_r1(
+                "pmcoa_retrieval": eval_pmcoa_retrieval(
                     student=probe_model,
                     teacher=teacher,
                     image_dir=args.pmc_oa_image_dir,
-                    jsonl_path=args.pmc_oa_jsonl,
-                    max_samples=args.pmcoa_eval_samples,
+                    jsonl_path=args.pmc_oa_test_jsonl,
                     batch_size=min(64, args.batch_size),
                     device=device,
                     seed=args.seed,
                 ),
             }
-            writer.add_scalar("eval/pmcoa_i2t_r1", float(vlm_eval["pmcoa_retrieval"]["pmcoa_i2t_r1"]), epoch)
+            ret = vlm_eval["pmcoa_retrieval"]
+            for k in (1, 5, 10):
+                writer.add_scalar(f"eval/pmcoa_i2t_r{k}", float(ret[f"pmcoa_i2t_r{k}"]), epoch)
+                writer.add_scalar(f"eval/pmcoa_t2i_r{k}", float(ret[f"pmcoa_t2i_r{k}"]), epoch)
 
         def _val_metric(probe: Optional[dict]) -> Optional[float]:
             if probe is None:
                 return None
             return float(probe.get("val_macro_auroc") or probe.get("macro_auroc") or 0.0)
+
+        for ds_key, p in probe_result.items():
+            m = _val_metric(p)
+            if m is not None and m > best_per_dataset.get(ds_key, {}).get("metric", -1.0):
+                best_per_dataset[ds_key] = {"epoch": epoch, "metric": m, "probe": p}
 
         tracked = None
         if probe_result["chexpert_probe"] is not None:
@@ -445,6 +539,7 @@ def train_loop(
         "run_dir": str(run_dir),
         "last_ckpt": str(last_ckpt),
         "best_probe": best_probe_result,
+        "best_per_dataset": best_per_dataset,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary, probe_result
